@@ -41,6 +41,7 @@ class MainActivity : Activity() {
     @Volatile private var next: Card? = null
     @Volatile private var fetching = false
     @Volatile private var loading = false
+    @Volatile private var generation = 0   // bumps when interests change; stale fetches are discarded
     private val recentHooks = ArrayList<String>()
 
     private lateinit var statusView: TextView
@@ -104,8 +105,14 @@ class MainActivity : Activity() {
         root.addView(btn("Save & start") {
             val picked = boxes.filter { it.isChecked }.map { it.text.toString() }
             if (picked.isEmpty()) { msg.text = "Pick at least one interest." } else {
-                prefs.edit().putString("tags", picked.joinToString("|")).apply()
-                current = null; next = null
+                val old = selected()
+                val blocked = ((prefs.getString("blocked", "") ?: "").split("|").filter { it.isNotEmpty() } +
+                    old.filter { !picked.contains(it) }).filter { !picked.contains(it) }.distinct()
+                prefs.edit().putString("tags", picked.joinToString("|"))
+                    .putString("blocked", blocked.joinToString("|")).apply()
+                generation++
+                current = null; next = null; loading = false; fetching = false
+                recentHooks.clear()
                 showFeed()
             }
         })
@@ -159,7 +166,8 @@ class MainActivity : Activity() {
         if (r >= 90) return Pair(WILD[rnd.nextInt(WILD.size)], "unexpected")
         if (r >= 70) {
             val cats = CATS.filter { e -> e.value.any { sel.contains(it) } }
-            val adj = cats.values.flatten().filter { !sel.contains(it) }
+            val blocked = (prefs.getString("blocked", "") ?: "").split("|")
+            val adj = cats.values.flatten().filter { !sel.contains(it) && !blocked.contains(it) }
             if (adj.isNotEmpty()) return Pair(adj[rnd.nextInt(adj.size)], "adjacent")
         }
         val pool = sel.filter { weight(it) > 0 }.ifEmpty { sel }
@@ -194,9 +202,13 @@ class MainActivity : Activity() {
     private fun prefetch() {
         if (next != null || fetching) return
         fetching = true
+        val gen = generation
         Thread {
-            try { next = fetchCard() } catch (e: Exception) { /* ignore: next tap retries */ }
-            fetching = false
+            try {
+                val c = fetchCard()
+                if (gen == generation) next = c      // discard if interests changed meanwhile
+            } catch (e: Exception) { /* ignore: next tap retries */ }
+            if (gen == generation) fetching = false
         }.start()
     }
 
@@ -205,11 +217,12 @@ class MainActivity : Activity() {
         val n = next
         if (n != null) { next = null; show(n); prefetch(); return }
         loading = true
+        val gen = generation
         statusView.text = "Fetching a card..."
         Thread {
             try {
                 val c = fetchCard()
-                runOnUiThread { loading = false; show(c); prefetch() }
+                runOnUiThread { if (gen == generation) { loading = false; show(c); prefetch() } }
             } catch (e: Exception) {
                 runOnUiThread { loading = false; statusView.text = "FAIL: ${e.javaClass.simpleName}: ${e.message}\nTap Next card to retry." }
             }
