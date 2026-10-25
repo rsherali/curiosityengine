@@ -12,6 +12,9 @@ import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManagerFactory
+import java.security.KeyStore
+import org.conscrypt.Conscrypt
 
 /** Forces TLS 1.1/1.2 on sockets. Android 4.4 supports TLS 1.2 but leaves it off by default. */
 class Tls12SocketFactory(private val d: SSLSocketFactory) : SSLSocketFactory() {
@@ -40,9 +43,16 @@ object Net {
     private val GEMINI_MODELS = listOf("gemini-flash-latest", "gemini-flash-lite-latest")
     private val OPENROUTER_MODELS = listOf("openrouter/free", "meta-llama/llama-3.3-70b-instruct:free")
 
-    private fun open(url: String): HttpsURLConnection {
+    private fun open(url: String, conscrypt: Boolean): HttpsURLConnection {
         val c = URL(url).openConnection() as HttpsURLConnection
-        if (Build.VERSION.SDK_INT < 21) {
+        if (conscrypt) {
+            // Modern TLS stack bundled in the app (used when the OS stack fails the handshake)
+            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            tmf.init(null as KeyStore?)
+            val sc = SSLContext.getInstance("TLS", Conscrypt.newProvider())
+            sc.init(null, tmf.trustManagers, null)
+            c.sslSocketFactory = sc.socketFactory
+        } else if (Build.VERSION.SDK_INT < 21) {
             val sc = SSLContext.getInstance("TLSv1.2")
             sc.init(null, null, null)
             c.sslSocketFactory = Tls12SocketFactory(sc.socketFactory)
@@ -52,9 +62,8 @@ object Net {
         return c
     }
 
-    /** Returns Pair(httpCode, bodyText). Throws on network/TLS failure. */
-    fun postJson(url: String, headers: Map<String, String>, body: String): Pair<Int, String> {
-        val c = open(url)
+    private fun doPost(url: String, headers: Map<String, String>, body: String, conscrypt: Boolean): Pair<Int, String> {
+        val c = open(url, conscrypt)
         c.requestMethod = "POST"
         c.setRequestProperty("Content-Type", "application/json")
         for ((k, v) in headers) c.setRequestProperty(k, v)
@@ -67,6 +76,19 @@ object Net {
         } ?: ""
         c.disconnect()
         return Pair(code, text)
+    }
+
+    /** Returns Pair(httpCode, bodyText). Tries the OS TLS first; on handshake failure retries with Conscrypt. */
+    fun postJson(url: String, headers: Map<String, String>, body: String): Pair<Int, String> {
+        try {
+            return doPost(url, headers, body, false)
+        } catch (e: javax.net.ssl.SSLException) {
+            try {
+                return doPost(url, headers, body, true)
+            } catch (e2: Throwable) {
+                throw RuntimeException("OS TLS: ${e.message} | Conscrypt: ${e2.javaClass.simpleName}: ${e2.message}")
+            }
+        }
     }
 
     /** Tries each model with retries on busy errors. call(model) returns (code, body). */

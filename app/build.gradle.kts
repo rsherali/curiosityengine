@@ -26,4 +26,5 @@ android {
 
 dependencies {
     implementation("androidx.multidex:multidex:2.0.1")
+    implementation("org.conscrypt:conscrypt-android:2.5.2")
 }
