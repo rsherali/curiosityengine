@@ -39,7 +39,7 @@ object Net {
     /** Provider ids. Model names are unverified aliases; each list is tried in order. */
     val PROVIDERS = listOf("Groq", "Gemini", "OpenRouter")
 
-    private val GROQ_MODELS = listOf("llama-3.3-70b-versatile", "llama-3.1-8b-instant")
+    private val GROQ_MODELS = listOf("openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant")
     private val GEMINI_MODELS = listOf("gemini-flash-latest", "gemini-flash-lite-latest")
     private val OPENROUTER_MODELS = listOf("openrouter/free", "meta-llama/llama-3.3-70b-instruct:free")
 
@@ -91,6 +91,20 @@ object Net {
         }
     }
 
+    /** GET helper (OS TLS first, then Conscrypt). */
+    private fun getText(url: String, headers: Map<String, String>): String {
+        fun once(conscrypt: Boolean): String {
+            val c = open(url, conscrypt)
+            for ((k, v) in headers) c.setRequestProperty(k, v)
+            val code = c.responseCode
+            val st = if (code < 400) c.inputStream else c.errorStream
+            val t = st?.let { BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() } } ?: ""
+            c.disconnect()
+            return t
+        }
+        return try { once(false) } catch (e: javax.net.ssl.SSLException) { once(true) }
+    }
+
     /** Tries each model with retries on busy errors. call(model) returns (code, body). */
     private fun tryModels(models: List<String>, call: (String) -> Pair<Int, String>, extract: (String) -> String): String {
         var last = "no attempt"
@@ -120,14 +134,28 @@ object Net {
         })
     }
 
-    private fun openAiStyle(url: String, key: String, models: List<String>, prompt: String): String =
-        tryModels(models, { m ->
-            val req = JSONObject().put("model", m)
-                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
-            postJson(url, mapOf("Authorization" to "Bearer $key"), req.toString())
-        }, { t ->
-            JSONObject(t).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
-        })
+    private fun openAiStyle(url: String, key: String, models: List<String>, prompt: String): String {
+        try {
+            return tryModels(models, { m ->
+                val req = JSONObject().put("model", m)
+                    .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+                postJson(url, mapOf("Authorization" to "Bearer $key"), req.toString())
+            }, { t ->
+                JSONObject(t).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+            })
+        } catch (e: RuntimeException) {
+            if (e.message?.contains("HTTP 404") == true || e.message?.contains("HTTP 400") == true) {
+                // Model names are stale: show what this key can actually use
+                val ids = try {
+                    val arr = JSONObject(getText(url.replace("/chat/completions", "/models"), mapOf("Authorization" to "Bearer $key")))
+                        .getJSONArray("data")
+                    (0 until arr.length()).joinToString(", ") { arr.getJSONObject(it).getString("id") }
+                } catch (e2: Exception) { "(could not list models: ${e2.message})" }
+                throw RuntimeException("${e.message}\nAvailable models: $ids")
+            }
+            throw e
+        }
+    }
 
     /** Ask one provider. Returns raw model text. */
     fun ask(provider: String, key: String, prompt: String): String = when (provider) {
