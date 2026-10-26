@@ -2,12 +2,15 @@ package com.curiosityengine.app
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.graphics.Color
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -25,8 +28,10 @@ class Card(val topic: String, val kind: String, val via: String, val pillar: Str
     var deeper: String? = null
     var revealed = false
     var guess = ""
+    var feedback = ""
+    var minutes = 5
     var actionState: String? = null          // "done" or "skip"
-    val flags = HashSet<String>()            // once-per-card events already scored
+    val flags = HashSet<String>()            // once-per-card events already logged
 }
 
 class Week(val pts: Map<String, Int>, val reveals: Int, val done: Int, val skipped: Int, val days: Int)
@@ -41,24 +46,32 @@ class MainActivity : Activity() {
         "Technology" to listOf("AI", "Computers", "Inventions", "Internet", "Robotics", "Gadgets"),
         "Food" to listOf("Cooking science", "World cuisines", "Ingredients", "Drinks", "Food history", "Nutrition")
     )
+    private val WILD = listOf("Music", "History", "Art", "Languages", "Psychology", "Architecture", "Geography", "Sport")
     private val PILLARS = listOf("THINK", "LEARN", "MOVE", "ENGAGE", "DISCOVER", "CONFIDENCE")
+    private val LIVE = setOf("LEARN", "THINK", "DISCOVER")
+    private val PURPOSE = mapOf(
+        "THINK" to "Reason, estimate, remember",
+        "LEARN" to "Understand something new",
+        "MOVE" to "Stretch, walk, move",
+        "ENGAGE" to "Talk to someone",
+        "DISCOVER" to "Try the unexpected",
+        "CONFIDENCE" to "Step outside your comfort zone"
+    )
     private val HINT = mapOf(
         "THINK" to "a mental exercise: a memory, logic or estimation challenge to do without a screen",
-        "LEARN" to "a way to learn one more thing, e.g. look up or explain it to someone",
-        "MOVE" to "a physical activity such as a short walk, stretch or standing task",
-        "ENGAGE" to "involving a real person or place, e.g. ask someone a question or visit somewhere",
-        "DISCOVER" to "trying something new or unfamiliar related to the topic",
-        "CONFIDENCE" to "a small step outside the comfort zone, e.g. say something aloud or try something unsure"
+        "LEARN" to "a way to learn one more thing, e.g. look something up or explain it to someone",
+        "DISCOVER" to "trying something new or unfamiliar related to the topic"
     )
-    private val WEEKLY_TARGET = 10
-    private val WILD = listOf("Music", "History", "Art", "Languages", "Psychology", "Architecture", "Geography", "Sport")
+    private val WEEKLY_TARGET = 30   // minutes per pillar per week
 
-    // ---- feed state ----
+    // ---- state ----
+    private var screenName = "home"
+    private var mode = "LEARN"
     private var current: Card? = null
     @Volatile private var next: Card? = null
     @Volatile private var fetching = false
     @Volatile private var loading = false
-    @Volatile private var generation = 0   // bumps when interests change; stale fetches are discarded
+    @Volatile private var generation = 0   // bumps when the section/interests change; stale fetches are discarded
     private val recentHooks = ArrayList<String>()
 
     private lateinit var statusView: TextView
@@ -72,7 +85,7 @@ class MainActivity : Activity() {
     private lateinit var actionView: TextView
     private lateinit var actionRow: LinearLayout
 
-    // ---------- backup: survives uninstall (lives in shared storage, not app storage) ----------
+    // ---------- backup: survives uninstall (shared storage, not app storage) ----------
     private fun backupFile(): java.io.File =
         java.io.File(java.io.File(android.os.Environment.getExternalStorageDirectory(), "CuriosityEngine"), "backup.json")
 
@@ -86,7 +99,7 @@ class MainActivity : Activity() {
             val f = backupFile()
             f.parentFile?.mkdirs()
             f.writeText(o.toString())
-        } catch (e: Exception) { /* backup is best-effort */ }
+        } catch (e: Exception) { /* best-effort */ }
     }
 
     private fun importPrefsIfEmpty() {
@@ -105,15 +118,16 @@ class MainActivity : Activity() {
         } catch (e: Exception) { /* ignore */ }
     }
 
-    override fun onPause() {
-        super.onPause()
-        exportPrefs()
+    override fun onPause() { super.onPause(); exportPrefs() }
+
+    override fun onBackPressed() {
+        if (screenName != "home" && selected().isNotEmpty()) showHome() else super.onBackPressed()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         importPrefsIfEmpty()
-        if (selected().isEmpty()) showInterests() else showFeed()
+        if (selected().isEmpty()) showInterests() else showHome()
     }
 
     // ---------- helpers ----------
@@ -126,11 +140,11 @@ class MainActivity : Activity() {
     private fun text(t: String, size: Float, bold: Boolean = false) = TextView(this).apply {
         text = t; textSize = size
         if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
-        setPadding(0, dp(6), 0, dp(6))
+        setPadding(0, dp(4), 0, dp(4))
     }
 
     private fun btn(t: String, onClick: () -> Unit) = Button(this).apply {
-        text = t; setOnClickListener { onClick() }
+        text = t; minHeight = dp(48); setOnClickListener { onClick() }
     }
 
     private fun row(vararg buttons: Button): LinearLayout = LinearLayout(this).apply {
@@ -138,22 +152,27 @@ class MainActivity : Activity() {
         for (b in buttons) addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
     }
 
-    private fun screen(content: LinearLayout) {
+    private fun screen(name: String, content: LinearLayout) {
+        screenName = name
         content.setPadding(dp(16), dp(16), dp(16), dp(16))
         setContentView(ScrollView(this).apply { addView(content) })
     }
 
     private fun vertical() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-    // ---------- event log ----------
-    private fun logEvent(type: String, pillar: String, pts: Int) {
+    private fun openUrl(u: String) {
+        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u))) } catch (e: Exception) { }
+    }
+
+    // ---------- event log (minutes invested) ----------
+    private fun logEvent(type: String, pillar: String, mins: Int) {
         var arr = try { JSONArray(prefs.getString("log", "[]")) } catch (x: Exception) { JSONArray() }
         if (arr.length() > 700) {
             val trimmed = JSONArray()
             for (i in arr.length() - 500 until arr.length()) trimmed.put(arr.get(i))
             arr = trimmed
         }
-        arr.put(JSONObject().put("t", System.currentTimeMillis()).put("type", type).put("p", pillar).put("pts", pts))
+        arr.put(JSONObject().put("t", System.currentTimeMillis()).put("type", type).put("p", pillar).put("m", mins))
         prefs.edit().putString("log", arr.toString()).apply()
     }
 
@@ -170,7 +189,8 @@ class MainActivity : Activity() {
             if (t < since) continue
             days.add(t / 86400000L)
             val p = o.optString("p")
-            if (pts.containsKey(p)) pts[p] = (pts[p] ?: 0) + o.optInt("pts")
+            val m = o.optInt("m", o.optInt("pts"))   // older entries stored points; treat as minutes
+            if (pts.containsKey(p)) pts[p] = (pts[p] ?: 0) + m
             when (o.optString("type")) {
                 "reveal" -> reveals++
                 "action_done" -> done++
@@ -180,18 +200,142 @@ class MainActivity : Activity() {
         return Week(pts, reveals, done, skipped, days.size)
     }
 
-    private fun pickPillar(): String {
-        val w = weekly().pts
-        val min = PILLARS.minOf { w[it] ?: 0 }
-        val weakest = PILLARS.filter { (w[it] ?: 0) == min }
-        return if (rnd.nextInt(100) < 60) weakest[rnd.nextInt(weakest.size)] else PILLARS[rnd.nextInt(PILLARS.size)]
+    private fun focusPillar(w: Week): String {
+        val min = PILLARS.minOf { w.pts[it] ?: 0 }
+        val ties = PILLARS.filter { (w.pts[it] ?: 0) == min }
+        return ties[((System.currentTimeMillis() / 86400000L) % ties.size).toInt()]
     }
 
-    // ---------- 1. Interests ----------
+    private fun statusLabel(m: Int) = when {
+        m == 0 -> "Nothing this week"
+        m < WEEKLY_TARGET / 2 -> "Not enough"
+        m < WEEKLY_TARGET -> "Getting there"
+        else -> "On track"
+    }
+
+    private fun statusColor(m: Int) = when {
+        m == 0 -> "#F8D7DA"
+        m < WEEKLY_TARGET / 2 -> "#FFE8B3"
+        m < WEEKLY_TARGET -> "#E2F0CB"
+        else -> "#C8E6C9"
+    }
+
+    private fun bar(m: Int): LinearLayout {
+        val b = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Color.parseColor("#CCCCCC")) }
+        val f = minOf(m, WEEKLY_TARGET)
+        val fill = View(this).apply { setBackgroundColor(Color.parseColor(if (m >= WEEKLY_TARGET) "#2E7D32" else "#3F51B5")) }
+        b.addView(fill, LinearLayout.LayoutParams(0, dp(10), f.toFloat()))
+        b.addView(View(this), LinearLayout.LayoutParams(0, dp(10), (WEEKLY_TARGET - f).toFloat()))
+        return b
+    }
+
+    /** Slim six-pillar balance strip, shown on section screens. Tap = home. */
+    private fun strip(): LinearLayout {
+        val w = weekly()
+        val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (p in PILLARS) {
+            val m = w.pts[p] ?: 0
+            val cell = TextView(this).apply {
+                text = "$p\n${m} min"; textSize = 10f; gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#222222"))
+                setBackgroundColor(Color.parseColor(statusColor(m)))
+                setPadding(0, dp(6), 0, dp(6))
+                setOnClickListener { showHome() }
+            }
+            val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            lp.setMargins(dp(1), 0, dp(1), 0)
+            r.addView(cell, lp)
+        }
+        return r
+    }
+
+    // ---------- HOME (pillar dashboard) ----------
+    private fun showHome() {
+        val root = vertical()
+        val w = weekly()
+        val focus = focusPillar(w)
+        val total = PILLARS.sumOf { w.pts[it] ?: 0 }
+        root.addView(text("Curiosity Engine", 26f, true))
+        root.addView(text("Minutes invested this week. Target: $WEEKLY_TARGET min per pillar.", 13f))
+        root.addView(text(if (total == 0) "Nothing logged yet. Start with $focus." else "Focus: $focus (least time this week).", 16f, true))
+
+        var i = 0
+        while (i < PILLARS.size) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (p in listOf(PILLARS[i], PILLARS[i + 1])) {
+                val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+                r.addView(tile(p, w, focus), lp)
+            }
+            root.addView(r)
+            i += 2
+        }
+        root.addView(row(btn("Weekly review") { showReview() }, btn("Interests") { showInterests() }))
+        root.addView(row(btn("Favourites") { showFavourites() }, btn("Settings") { showSettings() }))
+        root.addView(text("Build v${version()}", 11f))
+        screen("home", root)
+    }
+
+    private fun tile(p: String, w: Week, focus: String): LinearLayout {
+        val m = w.pts[p] ?: 0
+        val t = vertical()
+        t.setPadding(dp(12), dp(12), dp(12), dp(12))
+        t.minimumHeight = dp(150)
+        t.setBackgroundColor(Color.parseColor(if (p == focus && (w.pts.values.sum() > 0 || true)) "#FFF3CD" else "#EEF1F8"))
+        t.addView(text(p, 18f, true))
+        t.addView(text(PURPOSE[p] ?: "", 12f))
+        t.addView(text("$m / $WEEKLY_TARGET min", 15f, true))
+        t.addView(bar(m), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)))
+        t.addView(text(statusLabel(m), 12f))
+        val tag = (if (p == focus) "FOCUS THIS WEEK  " else "") + (if (p in LIVE) "" else "Coming soon")
+        if (tag.isNotBlank()) t.addView(text(tag.trim(), 11f, true))
+        t.isClickable = true
+        t.setOnClickListener { openSection(p) }
+        return t
+    }
+
+    private fun openSection(p: String) {
+        if (p !in LIVE) { showPlaceholder(p); return }
+        if (mode != p) {
+            mode = p; current = null; next = null; generation++
+            recentHooks.clear(); loading = false; fetching = false
+        }
+        showFeed()
+    }
+
+    // ---------- placeholder sections (built one at a time) ----------
+    private fun showPlaceholder(p: String, msg: String = "") {
+        val root = vertical()
+        root.addView(btn("Back to home") { showHome() })
+        root.addView(strip())
+        root.addView(text(p, 24f, true))
+        root.addView(text(PURPOSE[p] ?: "", 14f))
+        val plan = when (p) {
+            "MOVE" -> "Planned: gentle movement reminders, plus links to short stretching videos and step suggestions."
+            "ENGAGE" -> "Planned: tiny nudges to talk to someone about anything. Little interactions count."
+            else -> "Planned: a ladder of small comfort-zone challenges, with a self-rating."
+        }
+        root.addView(text("This section is not built yet.\n$plan", 15f))
+        if (p == "MOVE") root.addView(btn("Find short stretching videos (opens browser)") {
+            openUrl("https://www.youtube.com/results?search_query=5+minute+stretching+for+beginners")
+        })
+        val m = weekly().pts[p] ?: 0
+        root.addView(text("This week: $m min (${statusLabel(m)})", 16f, true))
+        root.addView(text("Until it is built, log time you actually spent (self-reported):", 13f))
+        root.addView(row(
+            btn("+5 min") { logEvent("manual", p, 5); showPlaceholder(p, "Logged 5 min of $p.") },
+            btn("+10 min") { logEvent("manual", p, 10); showPlaceholder(p, "Logged 10 min of $p.") },
+            btn("+20 min") { logEvent("manual", p, 20); showPlaceholder(p, "Logged 20 min of $p.") }
+        ))
+        if (msg.isNotEmpty()) root.addView(text(msg, 14f))
+        screen("placeholder", root)
+    }
+
+    // ---------- Interests ----------
     private fun showInterests() {
         val root = vertical()
         root.addView(text("Choose your interests", 24f, true))
-        root.addView(text("Pick at least one. You can change this any time.", 14f))
+        root.addView(text("Pick at least one. They shape the topics inside each pillar. You can change them any time.", 14f))
         val boxes = ArrayList<CheckBox>()
         val chosen = selected()
         for ((cat, tags) in CATS) {
@@ -203,7 +347,7 @@ class MainActivity : Activity() {
         }
         val msg = text("", 14f)
         root.addView(msg)
-        root.addView(btn("Save & start") {
+        root.addView(btn("Save & continue") {
             val picked = boxes.filter { it.isChecked }.map { it.text.toString() }
             if (picked.isEmpty()) { msg.text = "Pick at least one interest." } else {
                 val old = selected()
@@ -215,28 +359,28 @@ class MainActivity : Activity() {
                 generation++
                 current = null; next = null; loading = false; fetching = false
                 recentHooks.clear()
-                showFeed()
+                showHome()
             }
         })
-        screen(root)
+        screen("interests", root)
     }
 
-    // ---------- 2. Feed ----------
+    // ---------- Section feed (LEARN / THINK / DISCOVER) ----------
     private fun showFeed() {
         val root = vertical()
         root.addView(row(
-            btn("Interests") { showInterests() },
-            btn("Favourites") { showFavourites() },
-            btn("Dashboard") { showDashboard() },
-            btn("Settings") { showSettings() }
+            btn("Home") { showHome() },
+            btn("Favourites") { showFavourites() }
         ))
+        root.addView(strip())
+        root.addView(text("$mode: ${PURPOSE[mode]}", 18f, true))
         topicView = text("", 13f)
         statusView = text("", 13f)
         hookView = text("", 22f, true)
         questionView = text("", 18f)
         answerView = text("", 16f).apply { visibility = View.GONE }
         deeperView = text("", 15f).apply { visibility = View.GONE }
-        guessField = EditText(this).apply { hint = "Your guess first? (optional, earns THINK points)" }
+        guessField = EditText(this).apply { hint = "Your guess first? (optional, you get feedback)" }
         revealBtn = btn("Show answer") { reveal() }
         actionView = text("", 16f, true)
         actionRow = row(
@@ -259,24 +403,30 @@ class MainActivity : Activity() {
         ))
         root.addView(deeperView)
         root.addView(btn("Next card") { loadNext() })
-        root.addView(text("Build v${version()}", 11f))
-        screen(root)
+        screen("feed", root)
 
         val c = current
         if (c != null) show(c) else loadNext()
     }
 
-    private fun pickTopic(): Pair<String, String> {
+    private fun adjacentTags(): List<String> {
         val sel = selected()
+        val blocked = (prefs.getString("blocked", "") ?: "").split("|")
+        return CATS.values.filter { v -> v.any { sel.contains(it) } }.flatten()
+            .filter { !sel.contains(it) && !blocked.contains(it) }
+    }
+
+    private fun pickTopic(m: String): Pair<String, String> {
+        val sel = selected()
+        val adj = adjacentTags()
         if (sel.isEmpty()) return Pair(WILD[rnd.nextInt(WILD.size)], "unexpected")
+        if (m == "DISCOVER") {
+            return if (adj.isNotEmpty() && rnd.nextInt(100) < 55) Pair(adj[rnd.nextInt(adj.size)], "adjacent")
+            else Pair(WILD[rnd.nextInt(WILD.size)], "unexpected")
+        }
         val r = rnd.nextInt(100)
         if (r >= 90) return Pair(WILD[rnd.nextInt(WILD.size)], "unexpected")
-        if (r >= 70) {
-            val cats = CATS.filter { e -> e.value.any { sel.contains(it) } }
-            val blocked = (prefs.getString("blocked", "") ?: "").split("|")
-            val adj = cats.values.flatten().filter { !sel.contains(it) && !blocked.contains(it) }
-            if (adj.isNotEmpty()) return Pair(adj[rnd.nextInt(adj.size)], "adjacent")
-        }
+        if (r >= 70 && adj.isNotEmpty()) return Pair(adj[rnd.nextInt(adj.size)], "adjacent")
         val pool = sel.filter { weight(it) > 0 }.ifEmpty { sel }
         var total = 0
         for (t in pool) total += maxOf(weight(t), 1)
@@ -293,18 +443,28 @@ class MainActivity : Activity() {
     }
 
     private fun fetchCard(): Card {
-        val (topic, kind) = pickTopic()
-        val pillar = pickPillar()
+        val m = mode
+        val (topic, kind) = pickTopic(m)
         val avoid = recentHooks.takeLast(6).joinToString(" | ")
-        val prompt = "You are a curiosity coach for a curious adult. Create one curiosity card about: $topic. " +
+        val style = when (m) {
+            "THINK" -> "Design the question so a person can make a genuine guess by reasoning, estimating, using logic or memory, not by knowing an obscure fact. "
+            "DISCOVER" -> "Choose an unfamiliar, unexpected angle on the topic. "
+            else -> ""
+        }
+        val prompt = "You are a curiosity coach for a curious adult. Create one curiosity card about: $topic. $style" +
             "Make it surprising and specific, not a generic fact. Avoid repeating these earlier hooks: $avoid. " +
-            "Reply with ONLY a JSON object, no other text, with string keys: " +
-            "hook (one intriguing sentence), question (a thought-provoking question), " +
-            "answer (2-3 sentences), fact (one surprising related fact), " +
-            "action (one small real-world action under 20 words that exercises the $pillar pillar: ${HINT[pillar]}; " +
-            "link it to the topic where natural; it must be doable today without special equipment)."
+            "Reply with ONLY a JSON object, no other text, with keys: " +
+            "hook (string, one intriguing sentence), question (string, a thought-provoking question), " +
+            "answer (string, 2-3 sentences), fact (string, one surprising related fact), " +
+            "action (string, one small real-world action under 20 words that exercises the $m pillar: ${HINT[m]}; " +
+            "link it to the topic where natural; doable today without special equipment), " +
+            "minutes (integer from 1 to 15: realistic minutes the action takes)."
         val (via, raw) = fetchText(prompt)
-        return Card(topic, kind, via, pillar, Net.extractJson(raw))
+        val j = Net.extractJson(raw)
+        val c = Card(topic, kind, via, m, j)
+        val mins = j.optInt("minutes", 5)
+        c.minutes = if (mins < 1) 5 else minOf(mins, 30)
+        return c
     }
 
     private fun prefetch() {
@@ -314,8 +474,8 @@ class MainActivity : Activity() {
         Thread {
             try {
                 val c = fetchCard()
-                if (gen == generation) next = c      // discard if interests changed meanwhile
-            } catch (e: Exception) { /* ignore: next tap retries */ }
+                if (gen == generation) next = c
+            } catch (e: Exception) { /* next tap retries */ }
             if (gen == generation) fetching = false
         }.start()
     }
@@ -341,7 +501,7 @@ class MainActivity : Activity() {
         current = c
         val j = c.json
         recentHooks.add(j.optString("hook"))
-        topicView.text = "${c.topic} (${c.kind}) | coaching: ${c.pillar} | via ${c.via}"
+        topicView.text = "${c.topic} (${c.kind}) | via ${c.via}"
         statusView.text = ""
         hookView.text = j.optString("hook")
         questionView.text = j.optString("question")
@@ -359,11 +519,11 @@ class MainActivity : Activity() {
             return
         }
         guessField.visibility = View.GONE; revealBtn.visibility = View.GONE
-        val g = if (c.guess.isNotEmpty()) "YOUR GUESS\n${c.guess}\n\n" else ""
+        val g = if (c.guess.isNotEmpty()) "YOUR GUESS\n${c.guess}\n${c.feedback}\n\n" else ""
         answerView.text = g + "ANSWER\n${j.optString("answer")}\n\nFACT\n${j.optString("fact")}"
         answerView.visibility = View.VISIBLE
         val st = c.actionState
-        actionView.text = "TRY TODAY (${c.pillar})\n${j.optString("action")}" +
+        actionView.text = "TRY TODAY (${c.pillar}, about ${c.minutes} min)\n${j.optString("action")}" +
             (if (st == "done") "\n[Done - logged]" else if (st == "skip") "\n[Skipped - logged]" else "")
         actionView.visibility = View.VISIBLE
         actionRow.visibility = if (st == null) View.VISIBLE else View.GONE
@@ -374,10 +534,39 @@ class MainActivity : Activity() {
         if (c.revealed) return
         c.guess = guessField.text.toString().trim()
         c.revealed = true
-        logEvent("reveal", "LEARN", 1)
-        if (c.guess.isNotEmpty()) logEvent("guess", "THINK", 2)
-        if (c.kind != "preferred") logEvent("explore", "DISCOVER", 1)
+        logEvent("reveal", c.pillar, 1)
+        if (c.kind != "preferred" && c.pillar != "DISCOVER") logEvent("explore", "DISCOVER", 1)
+        if (c.guess.isNotEmpty()) { c.feedback = "Checking your guess..."; judgeGuess(c) }
         applyState(c)
+    }
+
+    /** Asks the model to judge the typed guess and shows feedback. A real attempt earns 1 THINK minute. */
+    private fun judgeGuess(c: Card) {
+        val j = c.json
+        val prompt = "A learner was asked a question and typed a guess before seeing the answer. Judge the guess fairly. " +
+            "Question: ${j.optString("question")}. Correct answer: ${j.optString("answer")}. Learner's guess: ${c.guess}. " +
+            "Reply with ONLY a JSON object with string keys: verdict (exactly one of: spot_on, close, off, no_attempt; " +
+            "use no_attempt only for gibberish or a non-answer) and feedback (1-2 plain sentences, warm but honest: " +
+            "say what they got right, and what to adjust if anything)."
+        Thread {
+            var verdict = "error"
+            var fb = "Could not check your guess (no connection), but the effort counts."
+            try {
+                val (_, raw) = fetchText(prompt)
+                val o = Net.extractJson(raw)
+                verdict = o.optString("verdict")
+                fb = o.optString("feedback")
+            } catch (e: Exception) { /* keep fallback */ }
+            val label = when (verdict) {
+                "spot_on" -> "Spot on"; "close" -> "Close"; "off" -> "Not quite"
+                "no_attempt" -> "No real attempt"; else -> "Unchecked"
+            }
+            runOnUiThread {
+                c.feedback = "[$label] $fb"
+                if (c.flags.add("guessLogged") && verdict != "no_attempt") logEvent("guess", "THINK", 1)
+                if (current === c) applyState(c)
+            }
+        }.start()
     }
 
     private fun actionResult(state: String) {
@@ -385,12 +574,12 @@ class MainActivity : Activity() {
         if (c.actionState != null) return
         c.actionState = state
         if (state == "done") {
-            logEvent("action_done", c.pillar, 3)
-            logEvent("action_conf", "CONFIDENCE", 1)
-            statusView.text = "Action logged: +3 ${c.pillar}, +1 CONFIDENCE."
+            logEvent("action_done", c.pillar, c.minutes)
+            if (c.pillar != "CONFIDENCE") logEvent("action_conf", "CONFIDENCE", 1)
+            statusView.text = "Logged: ${c.minutes} min of ${c.pillar}."
         } else {
             logEvent("action_skip", c.pillar, 0)
-            statusView.text = "Skip logged. The dashboard will remember."
+            statusView.text = "Skip logged. The weekly review will remember."
         }
         applyState(c)
     }
@@ -402,10 +591,7 @@ class MainActivity : Activity() {
         when (kind) {
             "more" -> e.putInt("w_${c.topic}", weight(c.topic) + 2)
             "less" -> e.putInt("w_${c.topic}", maxOf(0, weight(c.topic) - 2))
-            "surprised" -> {
-                e.putInt("w_${c.topic}", weight(c.topic) + 1)
-                if (c.flags.add("surprised")) logEvent("surprised", "DISCOVER", 2)
-            }
+            "surprised" -> e.putInt("w_${c.topic}", weight(c.topic) + 1)
             "favourite" -> {
                 val arr = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
                 arr.put(JSONObject().put("topic", c.topic).put("card", c.json))
@@ -434,7 +620,7 @@ class MainActivity : Activity() {
                 val (_, raw) = fetchText(prompt)
                 runOnUiThread {
                     c.deeper = "GO DEEPER\n" + raw.trim()
-                    if (c.flags.add("deeper")) logEvent("deeper", "LEARN", 2)
+                    if (c.flags.add("deeper")) logEvent("deeper", c.pillar, 3)
                     if (current === c) { deeperView.text = c.deeper; deeperView.visibility = View.VISIBLE; statusView.text = "" }
                 }
             } catch (e: Exception) {
@@ -443,47 +629,36 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- Dashboard ----------
-    private fun showDashboard() {
+    // ---------- Weekly review ----------
+    private fun showReview() {
         val root = vertical()
-        root.addView(btn("Back") { showFeed() })
-        root.addView(text("Dashboard: last 7 days", 24f, true))
+        root.addView(btn("Back to home") { showHome() })
+        root.addView(text("Weekly review: last 7 days", 24f, true))
         val w = weekly()
-        root.addView(text("Target: $WEEKLY_TARGET points per pillar per week.", 13f))
+        root.addView(text("Target: $WEEKLY_TARGET minutes per pillar per week.", 13f))
         for (p in PILLARS) {
-            val pts = w.pts[p] ?: 0
-            val verdict = when {
-                pts == 0 -> "Nothing this week"
-                pts < WEEKLY_TARGET / 2 -> "Not enough"
-                pts < WEEKLY_TARGET -> "Getting there"
-                else -> "On track"
-            }
-            root.addView(text("$p: $pts pts - $verdict", 16f, true))
-            val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Color.parseColor("#DDDDDD")) }
-            val filled = minOf(pts, WEEKLY_TARGET)
-            val fill = View(this).apply { setBackgroundColor(Color.parseColor(if (pts >= WEEKLY_TARGET) "#2E7D32" else "#3F51B5")) }
-            bar.addView(fill, LinearLayout.LayoutParams(0, dp(14), filled.toFloat()))
-            bar.addView(View(this), LinearLayout.LayoutParams(0, dp(14), (WEEKLY_TARGET - filled).toFloat()))
-            root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(14)))
+            val m = w.pts[p] ?: 0
+            root.addView(text("$p: $m min - ${statusLabel(m)}", 16f, true))
+            root.addView(bar(m), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)))
         }
         root.addView(text("Honest take", 18f, true))
         root.addView(text(honestTake(w), 16f))
-        root.addView(text("Scoring: reveal +1 LEARN; own guess +2 THINK; non-preferred topic +1 DISCOVER; " +
-            "surprised +2 DISCOVER; go deeper +2 LEARN; action done +3 its pillar and +1 CONFIDENCE.", 12f))
+        root.addView(text("Minutes logged: reveal 1; real guess 1 (THINK); non-preferred topic 1 (DISCOVER); " +
+            "go deeper 3; action done = its estimated minutes (+1 CONFIDENCE); manual logs as entered.", 12f))
         var armed = false
         val reset = Button(this)
         reset.text = "Reset stats"
         reset.setOnClickListener {
             if (!armed) { armed = true; reset.text = "Tap again to confirm reset" } else {
-                prefs.edit().remove("log").apply(); showDashboard()
+                prefs.edit().remove("log").apply(); showReview()
             }
         }
         root.addView(reset)
-        screen(root)
+        screen("review", root)
     }
 
     private fun honestTake(w: Week): String {
-        if (w.reveals + w.done + w.skipped == 0) return "Nothing logged in the last 7 days. That is not enough to say anything yet. Open a card."
+        if (w.reveals + w.done + w.skipped + w.pts.values.sum() == 0) return "Nothing logged in the last 7 days. That is not enough to say anything yet. Open a pillar."
         val lines = ArrayList<String>()
         lines.add("Cards explored: ${w.reveals}. Actions done: ${w.done}. Actions skipped: ${w.skipped}. Active ${w.days} of 7 days.")
         if (w.reveals >= 5 && w.done == 0) lines.add("You have read a lot and done nothing. Knowing is not doing.")
@@ -491,7 +666,7 @@ class MainActivity : Activity() {
         else if (w.done >= 3) lines.add("Good: you are actually doing things, not just reading.")
         val low = PILLARS.filter { (w.pts[it] ?: 0) < WEEKLY_TARGET / 2 }
         if (low.size >= 4) lines.add("Not enough across ${low.size} of 6 pillars: ${low.joinToString(", ")}.")
-        else if (low.isNotEmpty()) lines.add("Weak spots: ${low.joinToString(", ")}. New cards will lean toward these.")
+        else if (low.isNotEmpty()) lines.add("Weak spots: ${low.joinToString(", ")}.")
         else lines.add("Balanced week. No pillar is below half target.")
         return lines.joinToString("\n\n")
     }
@@ -499,7 +674,7 @@ class MainActivity : Activity() {
     // ---------- Favourites ----------
     private fun showFavourites() {
         val root = vertical()
-        root.addView(btn("Back") { showFeed() })
+        root.addView(btn("Back to home") { showHome() })
         root.addView(text("Favourites", 24f, true))
         val arr = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
         if (arr.length() == 0) root.addView(text("Nothing saved yet. Tap Favourite on a card.", 16f))
@@ -508,13 +683,13 @@ class MainActivity : Activity() {
             root.addView(text("${o.optString("topic")}: ${c.optString("hook")}", 16f, true))
             root.addView(text("${c.optString("question")}\n${c.optString("answer")}", 14f))
         }
-        screen(root)
+        screen("favourites", root)
     }
 
     // ---------- Settings ----------
     private fun showSettings() {
         val root = vertical()
-        root.addView(btn("Back") { showFeed() })
+        root.addView(btn("Back to home") { showHome() })
         root.addView(text("Settings", 24f, true))
         root.addView(text("Build v${version()} | Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})", 13f))
         val choices = listOf("Auto") + Net.PROVIDERS
@@ -572,6 +747,6 @@ class MainActivity : Activity() {
             }
         }
         root.addView(erase)
-        screen(root)
+        screen("settings", root)
     }
 }
