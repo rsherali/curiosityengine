@@ -72,8 +72,47 @@ class MainActivity : Activity() {
     private lateinit var actionView: TextView
     private lateinit var actionRow: LinearLayout
 
+    // ---------- backup: survives uninstall (lives in shared storage, not app storage) ----------
+    private fun backupFile(): java.io.File =
+        java.io.File(java.io.File(android.os.Environment.getExternalStorageDirectory(), "CuriosityEngine"), "backup.json")
+
+    private fun exportPrefs() {
+        try {
+            if (prefs.all.isEmpty()) return
+            val o = JSONObject()
+            for ((k, v) in prefs.all) {
+                if (v is String) o.put(k, "s:$v") else if (v is Int) o.put(k, "i:$v")
+            }
+            val f = backupFile()
+            f.parentFile?.mkdirs()
+            f.writeText(o.toString())
+        } catch (e: Exception) { /* backup is best-effort */ }
+    }
+
+    private fun importPrefsIfEmpty() {
+        try {
+            if (prefs.all.isNotEmpty()) return
+            val f = backupFile()
+            if (!f.exists()) return
+            val o = JSONObject(f.readText())
+            val ed = prefs.edit()
+            for (k in o.keys()) {
+                val v = o.getString(k)
+                if (v.startsWith("s:")) ed.putString(k, v.substring(2))
+                else if (v.startsWith("i:")) ed.putInt(k, v.substring(2).toInt())
+            }
+            ed.commit()
+        } catch (e: Exception) { /* ignore */ }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        exportPrefs()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        importPrefsIfEmpty()
         if (selected().isEmpty()) showInterests() else showFeed()
     }
 
@@ -172,6 +211,7 @@ class MainActivity : Activity() {
                     old.filter { !picked.contains(it) }).filter { !picked.contains(it) }.distinct()
                 prefs.edit().putString("tags", picked.joinToString("|"))
                     .putString("blocked", blocked.joinToString("|")).apply()
+                exportPrefs()
                 generation++
                 current = null; next = null; loading = false; fetching = false
                 recentHooks.clear()
@@ -500,6 +540,7 @@ class MainActivity : Activity() {
             val name = choices[spinner.selectedItemPosition]
             if (name == "Auto") out.text = "Pick a provider to save its key." else {
                 prefs.edit().putString("key_$name", keyField.text.toString().trim()).apply()
+                exportPrefs()
                 out.text = "$name key saved. Providers with keys: ${Net.PROVIDERS.filter { keyFor(it).isNotEmpty() }}"
             }
         })
@@ -518,6 +559,19 @@ class MainActivity : Activity() {
         val stats = "Signals so far: more ${prefs.getInt("n_more", 0)}, less ${prefs.getInt("n_less", 0)}, " +
             "favourite ${prefs.getInt("n_favourite", 0)}, surprised ${prefs.getInt("n_surprised", 0)}"
         root.addView(text(stats, 13f))
+        root.addView(text("Data and keys are also backed up to the tablet folder CuriosityEngine/backup.json so they survive reinstalling. Anyone with file access to the tablet can read that file.", 12f))
+        var armed2 = false
+        val erase = Button(this)
+        erase.text = "Erase ALL data and backup"
+        erase.setOnClickListener {
+            if (!armed2) { armed2 = true; erase.text = "Tap again to confirm erase" } else {
+                prefs.edit().clear().commit()
+                try { backupFile().delete() } catch (e: Exception) { }
+                current = null; next = null
+                showInterests()
+            }
+        }
+        root.addView(erase)
         screen(root)
     }
 }
