@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.text.InputType
 import android.view.View
 import android.view.ViewGroup
+import android.graphics.Color
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -20,9 +21,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Random
 
-class Card(val topic: String, val kind: String, val via: String, val json: JSONObject) {
+class Card(val topic: String, val kind: String, val via: String, val pillar: String, val json: JSONObject) {
     var deeper: String? = null
+    var revealed = false
+    var guess = ""
+    var actionState: String? = null          // "done" or "skip"
+    val flags = HashSet<String>()            // once-per-card events already scored
 }
+
+class Week(val pts: Map<String, Int>, val reveals: Int, val done: Int, val skipped: Int, val days: Int)
 
 class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("ce_prefs", Context.MODE_PRIVATE) }
@@ -34,6 +41,16 @@ class MainActivity : Activity() {
         "Technology" to listOf("AI", "Computers", "Inventions", "Internet", "Robotics", "Gadgets"),
         "Food" to listOf("Cooking science", "World cuisines", "Ingredients", "Drinks", "Food history", "Nutrition")
     )
+    private val PILLARS = listOf("THINK", "LEARN", "MOVE", "ENGAGE", "DISCOVER", "CONFIDENCE")
+    private val HINT = mapOf(
+        "THINK" to "a mental exercise: a memory, logic or estimation challenge to do without a screen",
+        "LEARN" to "a way to learn one more thing, e.g. look up or explain it to someone",
+        "MOVE" to "a physical activity such as a short walk, stretch or standing task",
+        "ENGAGE" to "involving a real person or place, e.g. ask someone a question or visit somewhere",
+        "DISCOVER" to "trying something new or unfamiliar related to the topic",
+        "CONFIDENCE" to "a small step outside the comfort zone, e.g. say something aloud or try something unsure"
+    )
+    private val WEEKLY_TARGET = 10
     private val WILD = listOf("Music", "History", "Art", "Languages", "Psychology", "Architecture", "Geography", "Sport")
 
     // ---- feed state ----
@@ -51,6 +68,9 @@ class MainActivity : Activity() {
     private lateinit var answerView: TextView
     private lateinit var deeperView: TextView
     private lateinit var revealBtn: Button
+    private lateinit var guessField: EditText
+    private lateinit var actionView: TextView
+    private lateinit var actionRow: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,6 +105,48 @@ class MainActivity : Activity() {
     }
 
     private fun vertical() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+    // ---------- event log ----------
+    private fun logEvent(type: String, pillar: String, pts: Int) {
+        var arr = try { JSONArray(prefs.getString("log", "[]")) } catch (x: Exception) { JSONArray() }
+        if (arr.length() > 700) {
+            val trimmed = JSONArray()
+            for (i in arr.length() - 500 until arr.length()) trimmed.put(arr.get(i))
+            arr = trimmed
+        }
+        arr.put(JSONObject().put("t", System.currentTimeMillis()).put("type", type).put("p", pillar).put("pts", pts))
+        prefs.edit().putString("log", arr.toString()).apply()
+    }
+
+    private fun weekly(): Week {
+        val arr = try { JSONArray(prefs.getString("log", "[]")) } catch (x: Exception) { JSONArray() }
+        val since = System.currentTimeMillis() - 7L * 86400000L
+        val pts = HashMap<String, Int>()
+        for (p in PILLARS) pts[p] = 0
+        var reveals = 0; var done = 0; var skipped = 0
+        val days = HashSet<Long>()
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val t = o.optLong("t")
+            if (t < since) continue
+            days.add(t / 86400000L)
+            val p = o.optString("p")
+            if (pts.containsKey(p)) pts[p] = (pts[p] ?: 0) + o.optInt("pts")
+            when (o.optString("type")) {
+                "reveal" -> reveals++
+                "action_done" -> done++
+                "action_skip" -> skipped++
+            }
+        }
+        return Week(pts, reveals, done, skipped, days.size)
+    }
+
+    private fun pickPillar(): String {
+        val w = weekly().pts
+        val min = PILLARS.minOf { w[it] ?: 0 }
+        val weakest = PILLARS.filter { (w[it] ?: 0) == min }
+        return if (rnd.nextInt(100) < 60) weakest[rnd.nextInt(weakest.size)] else PILLARS[rnd.nextInt(PILLARS.size)]
+    }
 
     // ---------- 1. Interests ----------
     private fun showInterests() {
@@ -125,6 +187,7 @@ class MainActivity : Activity() {
         root.addView(row(
             btn("Interests") { showInterests() },
             btn("Favourites") { showFavourites() },
+            btn("Dashboard") { showDashboard() },
             btn("Settings") { showSettings() }
         ))
         topicView = text("", 13f)
@@ -133,14 +196,18 @@ class MainActivity : Activity() {
         questionView = text("", 18f)
         answerView = text("", 16f).apply { visibility = View.GONE }
         deeperView = text("", 15f).apply { visibility = View.GONE }
-        revealBtn = btn("Show answer") {
-            answerView.visibility = View.VISIBLE
-            revealBtn.visibility = View.GONE
-        }.apply { visibility = View.GONE }
+        guessField = EditText(this).apply { hint = "Your guess first? (optional, earns THINK points)" }
+        revealBtn = btn("Show answer") { reveal() }
+        actionView = text("", 16f, true)
+        actionRow = row(
+            btn("I did it") { actionResult("done") },
+            btn("Not today") { actionResult("skip") }
+        )
 
         root.addView(topicView); root.addView(statusView)
         root.addView(hookView); root.addView(questionView)
-        root.addView(revealBtn); root.addView(answerView)
+        root.addView(guessField); root.addView(revealBtn); root.addView(answerView)
+        root.addView(actionView); root.addView(actionRow)
         root.addView(row(
             btn("More like this") { signal("more") },
             btn("Less like this") { signal("less") },
@@ -187,16 +254,17 @@ class MainActivity : Activity() {
 
     private fun fetchCard(): Card {
         val (topic, kind) = pickTopic()
+        val pillar = pickPillar()
         val avoid = recentHooks.takeLast(6).joinToString(" | ")
         val prompt = "You are a curiosity coach for a curious adult. Create one curiosity card about: $topic. " +
             "Make it surprising and specific, not a generic fact. Avoid repeating these earlier hooks: $avoid. " +
             "Reply with ONLY a JSON object, no other text, with string keys: " +
             "hook (one intriguing sentence), question (a thought-provoking question), " +
             "answer (2-3 sentences), fact (one surprising related fact), " +
-            "action (one small real-world action to do today), " +
-            "pillar (one of THINK, LEARN, MOVE, ENGAGE, DISCOVER, CONFIDENCE)."
+            "action (one small real-world action under 20 words that exercises the $pillar pillar: ${HINT[pillar]}; " +
+            "link it to the topic where natural; it must be doable today without special equipment)."
         val (via, raw) = fetchText(prompt)
-        return Card(topic, kind, via, Net.extractJson(raw))
+        return Card(topic, kind, via, pillar, Net.extractJson(raw))
     }
 
     private fun prefetch() {
@@ -233,15 +301,58 @@ class MainActivity : Activity() {
         current = c
         val j = c.json
         recentHooks.add(j.optString("hook"))
-        topicView.text = "${c.topic} (${c.kind}) | ${j.optString("pillar")} | via ${c.via}"
+        topicView.text = "${c.topic} (${c.kind}) | coaching: ${c.pillar} | via ${c.via}"
         statusView.text = ""
         hookView.text = j.optString("hook")
         questionView.text = j.optString("question")
-        answerView.text = "ANSWER\n${j.optString("answer")}\n\nFACT\n${j.optString("fact")}\n\nTRY TODAY\n${j.optString("action")}"
-        answerView.visibility = View.GONE
-        revealBtn.visibility = View.VISIBLE
+        guessField.setText("")
+        applyState(c)
         val d = c.deeper
         if (d != null) { deeperView.text = d; deeperView.visibility = View.VISIBLE } else deeperView.visibility = View.GONE
+    }
+
+    private fun applyState(c: Card) {
+        val j = c.json
+        if (!c.revealed) {
+            guessField.visibility = View.VISIBLE; revealBtn.visibility = View.VISIBLE
+            answerView.visibility = View.GONE; actionView.visibility = View.GONE; actionRow.visibility = View.GONE
+            return
+        }
+        guessField.visibility = View.GONE; revealBtn.visibility = View.GONE
+        val g = if (c.guess.isNotEmpty()) "YOUR GUESS\n${c.guess}\n\n" else ""
+        answerView.text = g + "ANSWER\n${j.optString("answer")}\n\nFACT\n${j.optString("fact")}"
+        answerView.visibility = View.VISIBLE
+        val st = c.actionState
+        actionView.text = "TRY TODAY (${c.pillar})\n${j.optString("action")}" +
+            (if (st == "done") "\n[Done - logged]" else if (st == "skip") "\n[Skipped - logged]" else "")
+        actionView.visibility = View.VISIBLE
+        actionRow.visibility = if (st == null) View.VISIBLE else View.GONE
+    }
+
+    private fun reveal() {
+        val c = current ?: return
+        if (c.revealed) return
+        c.guess = guessField.text.toString().trim()
+        c.revealed = true
+        logEvent("reveal", "LEARN", 1)
+        if (c.guess.isNotEmpty()) logEvent("guess", "THINK", 2)
+        if (c.kind != "preferred") logEvent("explore", "DISCOVER", 1)
+        applyState(c)
+    }
+
+    private fun actionResult(state: String) {
+        val c = current ?: return
+        if (c.actionState != null) return
+        c.actionState = state
+        if (state == "done") {
+            logEvent("action_done", c.pillar, 3)
+            logEvent("action_conf", "CONFIDENCE", 1)
+            statusView.text = "Action logged: +3 ${c.pillar}, +1 CONFIDENCE."
+        } else {
+            logEvent("action_skip", c.pillar, 0)
+            statusView.text = "Skip logged. The dashboard will remember."
+        }
+        applyState(c)
     }
 
     private fun signal(kind: String) {
@@ -251,7 +362,10 @@ class MainActivity : Activity() {
         when (kind) {
             "more" -> e.putInt("w_${c.topic}", weight(c.topic) + 2)
             "less" -> e.putInt("w_${c.topic}", maxOf(0, weight(c.topic) - 2))
-            "surprised" -> e.putInt("w_${c.topic}", weight(c.topic) + 1)
+            "surprised" -> {
+                e.putInt("w_${c.topic}", weight(c.topic) + 1)
+                if (c.flags.add("surprised")) logEvent("surprised", "DISCOVER", 2)
+            }
             "favourite" -> {
                 val arr = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
                 arr.put(JSONObject().put("topic", c.topic).put("card", c.json))
@@ -280,12 +394,66 @@ class MainActivity : Activity() {
                 val (_, raw) = fetchText(prompt)
                 runOnUiThread {
                     c.deeper = "GO DEEPER\n" + raw.trim()
+                    if (c.flags.add("deeper")) logEvent("deeper", "LEARN", 2)
                     if (current === c) { deeperView.text = c.deeper; deeperView.visibility = View.VISIBLE; statusView.text = "" }
                 }
             } catch (e: Exception) {
                 runOnUiThread { statusView.text = "FAIL: ${e.javaClass.simpleName}: ${e.message}" }
             }
         }.start()
+    }
+
+    // ---------- Dashboard ----------
+    private fun showDashboard() {
+        val root = vertical()
+        root.addView(btn("Back") { showFeed() })
+        root.addView(text("Dashboard: last 7 days", 24f, true))
+        val w = weekly()
+        root.addView(text("Target: $WEEKLY_TARGET points per pillar per week.", 13f))
+        for (p in PILLARS) {
+            val pts = w.pts[p] ?: 0
+            val verdict = when {
+                pts == 0 -> "Nothing this week"
+                pts < WEEKLY_TARGET / 2 -> "Not enough"
+                pts < WEEKLY_TARGET -> "Getting there"
+                else -> "On track"
+            }
+            root.addView(text("$p: $pts pts - $verdict", 16f, true))
+            val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Color.parseColor("#DDDDDD")) }
+            val filled = minOf(pts, WEEKLY_TARGET)
+            val fill = View(this).apply { setBackgroundColor(Color.parseColor(if (pts >= WEEKLY_TARGET) "#2E7D32" else "#3F51B5")) }
+            bar.addView(fill, LinearLayout.LayoutParams(0, dp(14), filled.toFloat()))
+            bar.addView(View(this), LinearLayout.LayoutParams(0, dp(14), (WEEKLY_TARGET - filled).toFloat()))
+            root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(14)))
+        }
+        root.addView(text("Honest take", 18f, true))
+        root.addView(text(honestTake(w), 16f))
+        root.addView(text("Scoring: reveal +1 LEARN; own guess +2 THINK; non-preferred topic +1 DISCOVER; " +
+            "surprised +2 DISCOVER; go deeper +2 LEARN; action done +3 its pillar and +1 CONFIDENCE.", 12f))
+        var armed = false
+        val reset = Button(this)
+        reset.text = "Reset stats"
+        reset.setOnClickListener {
+            if (!armed) { armed = true; reset.text = "Tap again to confirm reset" } else {
+                prefs.edit().remove("log").apply(); showDashboard()
+            }
+        }
+        root.addView(reset)
+        screen(root)
+    }
+
+    private fun honestTake(w: Week): String {
+        if (w.reveals + w.done + w.skipped == 0) return "Nothing logged in the last 7 days. That is not enough to say anything yet. Open a card."
+        val lines = ArrayList<String>()
+        lines.add("Cards explored: ${w.reveals}. Actions done: ${w.done}. Actions skipped: ${w.skipped}. Active ${w.days} of 7 days.")
+        if (w.reveals >= 5 && w.done == 0) lines.add("You have read a lot and done nothing. Knowing is not doing.")
+        else if (w.skipped > w.done && w.skipped >= 3) lines.add("You have skipped more actions than you have done.")
+        else if (w.done >= 3) lines.add("Good: you are actually doing things, not just reading.")
+        val low = PILLARS.filter { (w.pts[it] ?: 0) < WEEKLY_TARGET / 2 }
+        if (low.size >= 4) lines.add("Not enough across ${low.size} of 6 pillars: ${low.joinToString(", ")}.")
+        else if (low.isNotEmpty()) lines.add("Weak spots: ${low.joinToString(", ")}. New cards will lean toward these.")
+        else lines.add("Balanced week. No pillar is below half target.")
+        return lines.joinToString("\n\n")
     }
 
     // ---------- Favourites ----------
