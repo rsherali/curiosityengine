@@ -30,6 +30,7 @@ class Card(val topic: String, val kind: String, val via: String, val pillar: Str
     var guess = ""
     var feedback = ""
     var minutes = 5
+    var level = 0
     var actionState: String? = null          // "done" or "skip"
     val flags = HashSet<String>()            // once-per-card events already logged
 }
@@ -62,6 +63,7 @@ class MainActivity : Activity() {
         "LEARN" to "a way to learn one more thing, e.g. look something up or explain it to someone",
         "DISCOVER" to "trying something new or unfamiliar related to the topic"
     )
+    private val LEVELS = listOf("Beginner", "Intermediate", "Advanced")
     private val WEEKLY_TARGET = 30   // minutes per pillar per week
 
     // ---- state ----
@@ -84,6 +86,10 @@ class MainActivity : Activity() {
     private lateinit var guessField: EditText
     private lateinit var actionView: TextView
     private lateinit var actionRow: LinearLayout
+    private lateinit var explainerView: TextView
+    private lateinit var hintBtn: Button
+    private lateinit var hintView: TextView
+    private lateinit var discoverRow: LinearLayout
 
     // ---------- backup: survives uninstall (shared storage, not app storage) ----------
     private fun backupFile(): java.io.File =
@@ -136,6 +142,9 @@ class MainActivity : Activity() {
     private fun keyFor(p: String): String = prefs.getString("key_$p", "")?.trim() ?: ""
     private fun selected(): List<String> = (prefs.getString("tags", "") ?: "").split("|").filter { it.isNotEmpty() }
     private fun weight(tag: String) = prefs.getInt("w_$tag", 3)
+    private fun lvl(tag: String) = prefs.getInt("lvl_$tag", 0).coerceIn(0, 2)
+    private fun blockedList(): List<String> = (prefs.getString("blocked", "") ?: "").split("|").filter { it.isNotEmpty() }
+    private fun wildTopics(): List<String> = WILD.filter { !blockedList().contains(it) }.ifEmpty { WILD }
 
     private fun text(t: String, size: Float, bold: Boolean = false) = TextView(this).apply {
         text = t; textSize = size
@@ -331,30 +340,47 @@ class MainActivity : Activity() {
         screen("placeholder", root)
     }
 
-    // ---------- Interests ----------
+    // ---------- Interests (with a level per interest) ----------
+    private class IRow(val tag: String, val cb: CheckBox, val sp: Spinner)
+
     private fun showInterests() {
         val root = vertical()
         root.addView(text("Choose your interests", 24f, true))
-        root.addView(text("Pick at least one. They shape the topics inside each pillar. You can change them any time.", 14f))
-        val boxes = ArrayList<CheckBox>()
+        root.addView(text("Tick what interests you and set your level for each. Too hard or too easy? You can change it any time, or tap Too hard / Too easy on a card.", 14f))
+        val rows = ArrayList<IRow>()
         val chosen = selected()
-        for ((cat, tags) in CATS) {
+        val known = CATS.values.flatten()
+        val groups = LinkedHashMap<String, List<String>>()
+        for ((cat, tags) in CATS) groups[cat] = tags
+        val extra = chosen.filter { !known.contains(it) }
+        if (extra.isNotEmpty()) groups["Discovered"] = extra
+        for ((cat, tags) in groups) {
             root.addView(text(cat, 18f, true))
             for (t in tags) {
+                val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
                 val cb = CheckBox(this).apply { text = t; isChecked = chosen.contains(t) }
-                boxes.add(cb); root.addView(cb)
+                val sp = Spinner(this)
+                sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, LEVELS)
+                sp.setSelection(lvl(t))
+                sp.isEnabled = cb.isChecked
+                cb.setOnCheckedChangeListener { _, checked -> sp.isEnabled = checked }
+                line.addView(cb, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                line.addView(sp, LinearLayout.LayoutParams(dp(170), ViewGroup.LayoutParams.WRAP_CONTENT))
+                rows.add(IRow(t, cb, sp)); root.addView(line)
             }
         }
         val msg = text("", 14f)
         root.addView(msg)
         root.addView(btn("Save & continue") {
-            val picked = boxes.filter { it.isChecked }.map { it.text.toString() }
+            val picked = rows.filter { it.cb.isChecked }
             if (picked.isEmpty()) { msg.text = "Pick at least one interest." } else {
+                val names = picked.map { it.tag }
                 val old = selected()
-                val blocked = ((prefs.getString("blocked", "") ?: "").split("|").filter { it.isNotEmpty() } +
-                    old.filter { !picked.contains(it) }).filter { !picked.contains(it) }.distinct()
-                prefs.edit().putString("tags", picked.joinToString("|"))
-                    .putString("blocked", blocked.joinToString("|")).apply()
+                val blocked = (blockedList() + old.filter { !names.contains(it) }).filter { !names.contains(it) }.distinct()
+                val ed = prefs.edit()
+                ed.putString("tags", names.joinToString("|")).putString("blocked", blocked.joinToString("|"))
+                for (r in picked) ed.putInt("lvl_${r.tag}", r.sp.selectedItemPosition)
+                ed.apply()
                 exportPrefs()
                 generation++
                 current = null; next = null; loading = false; fetching = false
@@ -380,7 +406,24 @@ class MainActivity : Activity() {
         questionView = text("", 18f)
         answerView = text("", 16f).apply { visibility = View.GONE }
         deeperView = text("", 15f).apply { visibility = View.GONE }
-        guessField = EditText(this).apply { hint = "Your guess first? (optional, you get feedback)" }
+        guessField = EditText(this).apply {
+            hint = when (mode) {
+                "THINK" -> "Your answer (needed to earn THINK minutes)"
+                "LEARN" -> "Your answer to the check question (optional)"
+                else -> "Your guess (optional)"
+            }
+        }
+        explainerView = text("", 16f).apply { visibility = View.GONE }
+        hintView = text("", 15f).apply { visibility = View.GONE }
+        hintBtn = btn("Give me a hint") {
+            val c = current
+            if (c != null) { c.flags.add("hint"); applyState(c) }
+        }.apply { visibility = View.GONE }
+        discoverRow = row(
+            btn("Look it up") { val c = current; if (c != null) openUrl("https://www.google.com/search?q=" + Uri.encode(c.json.optString("search", c.topic))) },
+            btn("Add to my interests") { adoptTopic() },
+            btn("Not for me") { notForMe() }
+        )
         revealBtn = btn("Show answer") { reveal() }
         actionView = text("", 16f, true)
         actionRow = row(
@@ -389,8 +432,10 @@ class MainActivity : Activity() {
         )
 
         root.addView(topicView); root.addView(statusView)
-        root.addView(hookView); root.addView(questionView)
+        root.addView(hookView); root.addView(explainerView); root.addView(questionView)
+        root.addView(hintBtn); root.addView(hintView)
         root.addView(guessField); root.addView(revealBtn); root.addView(answerView)
+        root.addView(discoverRow)
         root.addView(actionView); root.addView(actionRow)
         root.addView(row(
             btn("More like this") { signal("more") },
@@ -400,6 +445,10 @@ class MainActivity : Activity() {
         root.addView(row(
             btn("Go deeper") { goDeeper() },
             btn("Surprised me") { signal("surprised") }
+        ))
+        root.addView(row(
+            btn("Too hard") { signal("toohard") },
+            btn("Too easy") { signal("tooeasy") }
         ))
         root.addView(deeperView)
         root.addView(btn("Next card") { loadNext() })
@@ -419,13 +468,13 @@ class MainActivity : Activity() {
     private fun pickTopic(m: String): Pair<String, String> {
         val sel = selected()
         val adj = adjacentTags()
-        if (sel.isEmpty()) return Pair(WILD[rnd.nextInt(WILD.size)], "unexpected")
+        if (sel.isEmpty()) return Pair(wildTopics()[rnd.nextInt(wildTopics().size)], "unexpected")
         if (m == "DISCOVER") {
             return if (adj.isNotEmpty() && rnd.nextInt(100) < 55) Pair(adj[rnd.nextInt(adj.size)], "adjacent")
-            else Pair(WILD[rnd.nextInt(WILD.size)], "unexpected")
+            else Pair(wildTopics()[rnd.nextInt(wildTopics().size)], "unexpected")
         }
         val r = rnd.nextInt(100)
-        if (r >= 90) return Pair(WILD[rnd.nextInt(WILD.size)], "unexpected")
+        if (r >= 90) return Pair(wildTopics()[rnd.nextInt(wildTopics().size)], "unexpected")
         if (r >= 70 && adj.isNotEmpty()) return Pair(adj[rnd.nextInt(adj.size)], "adjacent")
         val pool = sel.filter { weight(it) > 0 }.ifEmpty { sel }
         var total = 0
@@ -442,26 +491,42 @@ class MainActivity : Activity() {
         return Pair(choice, Net.ask(choice, keyFor(choice), prompt))
     }
 
+    private fun levelText(level: Int) = when (level) {
+        0 -> "BEGINNER: assume no prior knowledge, use plain everyday words, no jargon; something a curious 12-year-old could attempt."
+        1 -> "INTERMEDIATE: assume some familiarity; basic terms are fine."
+        else -> "ADVANCED: assume a solid background; technical and nuanced is fine."
+    }
+
     private fun fetchCard(): Card {
         val m = mode
         val (topic, kind) = pickTopic(m)
+        val level = lvl(topic)
         val avoid = recentHooks.takeLast(6).joinToString(" | ")
-        val style = when (m) {
-            "THINK" -> "Design the question so a person can make a genuine guess by reasoning, estimating, using logic or memory, not by knowing an obscure fact. "
-            "DISCOVER" -> "Choose an unfamiliar, unexpected angle on the topic. "
-            else -> ""
+        val extra = when (m) {
+            "LEARN" -> "This is a TEACHING card. 'explainer' is 4-5 clear sentences that teach the idea; the learner reads it first. " +
+                "'question' is a short check question answerable from the explainer; 'answer' is its correct answer (1-2 sentences). "
+            "THINK" -> "This is a BRAIN CHALLENGE card: a logic puzzle, estimation, pattern, or reasoning problem related to the topic, " +
+                "solvable by reasoning without obscure facts. 'question' states the whole challenge; 'answer' gives the solution with brief reasoning; " +
+                "'hint' is a nudge that does not give the answer away. "
+            else -> "This is a DISCOVERY card that tempts the learner toward something new. 'hook' is a vivid teaser; 'answer' is a 2-sentence taste of the topic; " +
+                "'question' is a wondering question; 'search' is a 3-6 word web search to explore it. "
         }
-        val prompt = "You are a curiosity coach for a curious adult. Create one curiosity card about: $topic. $style" +
-            "Make it surprising and specific, not a generic fact. Avoid repeating these earlier hooks: $avoid. " +
-            "Reply with ONLY a JSON object, no other text, with keys: " +
-            "hook (string, one intriguing sentence), question (string, a thought-provoking question), " +
-            "answer (string, 2-3 sentences), fact (string, one surprising related fact), " +
-            "action (string, one small real-world action under 20 words that exercises the $m pillar: ${HINT[m]}; " +
-            "link it to the topic where natural; doable today without special equipment), " +
-            "minutes (integer from 1 to 15: realistic minutes the action takes)."
+        val keys = when (m) {
+            "LEARN" -> "hook, explainer, question, answer, fact, action, minutes"
+            "THINK" -> "hook, question, hint, answer, fact, action, minutes"
+            else -> "hook, question, answer, fact, search, action, minutes"
+        }
+        val prompt = "You are a curiosity coach. Create one card about: $topic. Difficulty level: ${levelText(level)} $extra" +
+            "Make it surprising and specific. Avoid repeating these earlier hooks: $avoid. " +
+            "Reply with ONLY a JSON object with these keys: $keys. All values are strings except minutes. " +
+            "'fact' is one surprising related fact. 'hook' is one intriguing sentence. " +
+            "'action' is one small real-world action under 20 words that exercises the $m pillar: ${HINT[m]}; " +
+            "link it to the topic where natural; doable today without special equipment. " +
+            "'minutes' is an integer from 1 to 15: realistic minutes the action takes."
         val (via, raw) = fetchText(prompt)
         val j = Net.extractJson(raw)
         val c = Card(topic, kind, via, m, j)
+        c.level = level
         val mins = j.optInt("minutes", 5)
         c.minutes = if (mins < 1) 5 else minOf(mins, 30)
         return c
@@ -501,11 +566,20 @@ class MainActivity : Activity() {
         current = c
         val j = c.json
         recentHooks.add(j.optString("hook"))
-        topicView.text = "${c.topic} (${c.kind}) | via ${c.via}"
+        topicView.text = "${c.topic} (${c.kind}) | ${LEVELS[c.level]} | via ${c.via}"
         statusView.text = ""
         hookView.text = j.optString("hook")
-        questionView.text = j.optString("question")
+        explainerView.text = "EXPLAINER\n" + j.optString("explainer")
+        questionView.text = when (c.pillar) {
+            "LEARN" -> "CHECK YOURSELF\n"
+            "THINK" -> "CHALLENGE\n"
+            else -> "WONDER\n"
+        } + j.optString("question")
         guessField.setText("")
+        if (c.pillar == "DISCOVER" && !c.revealed) {
+            c.revealed = true
+            if (c.flags.add("viewed")) logEvent("view", "DISCOVER", 1)
+        }
         applyState(c)
         val d = c.deeper
         if (d != null) { deeperView.text = d; deeperView.visibility = View.VISIBLE } else deeperView.visibility = View.GONE
@@ -513,14 +587,22 @@ class MainActivity : Activity() {
 
     private fun applyState(c: Card) {
         val j = c.json
+        val p = c.pillar
+        explainerView.visibility = if (p == "LEARN") View.VISIBLE else View.GONE
+        discoverRow.visibility = if (p == "DISCOVER") View.VISIBLE else View.GONE
+        val hinted = c.flags.contains("hint")
+        hintView.text = "HINT\n" + j.optString("hint")
+        hintView.visibility = if (p == "THINK" && hinted) View.VISIBLE else View.GONE
+        hintBtn.visibility = if (p == "THINK" && !c.revealed && !hinted) View.VISIBLE else View.GONE
         if (!c.revealed) {
             guessField.visibility = View.VISIBLE; revealBtn.visibility = View.VISIBLE
             answerView.visibility = View.GONE; actionView.visibility = View.GONE; actionRow.visibility = View.GONE
             return
         }
         guessField.visibility = View.GONE; revealBtn.visibility = View.GONE
-        val g = if (c.guess.isNotEmpty()) "YOUR GUESS\n${c.guess}\n${c.feedback}\n\n" else ""
-        answerView.text = g + "ANSWER\n${j.optString("answer")}\n\nFACT\n${j.optString("fact")}"
+        val label = when (p) { "DISCOVER" -> "A TASTE"; "THINK" -> "SOLUTION"; else -> "ANSWER" }
+        val g = if (c.guess.isNotEmpty()) "YOUR ANSWER\n${c.guess}\n${c.feedback}\n\n" else ""
+        answerView.text = g + "$label\n${j.optString("answer")}\n\nFACT\n${j.optString("fact")}"
         answerView.visibility = View.VISIBLE
         val st = c.actionState
         actionView.text = "TRY TODAY (${c.pillar}, about ${c.minutes} min)\n${j.optString("action")}" +
@@ -534,7 +616,9 @@ class MainActivity : Activity() {
         if (c.revealed) return
         c.guess = guessField.text.toString().trim()
         c.revealed = true
-        logEvent("reveal", c.pillar, 1)
+        val think = c.pillar == "THINK"
+        if (!think) logEvent("reveal", c.pillar, 1)       // THINK minutes come only from real attempts
+        if (think && c.guess.isEmpty()) statusView.text = "No attempt, no THINK minutes. Try an answer next time."
         if (c.kind != "preferred" && c.pillar != "DISCOVER") logEvent("explore", "DISCOVER", 1)
         if (c.guess.isNotEmpty()) { c.feedback = "Checking your guess..."; judgeGuess(c) }
         applyState(c)
@@ -563,7 +647,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 c.feedback = "[$label] $fb"
-                if (c.flags.add("guessLogged") && verdict != "no_attempt") logEvent("guess", "THINK", 1)
+                if (c.flags.add("guessLogged") && verdict != "no_attempt") logEvent("guess", "THINK", if (c.pillar == "THINK") 2 else 1)
                 if (current === c) applyState(c)
             }
         }.start()
@@ -592,6 +676,8 @@ class MainActivity : Activity() {
             "more" -> e.putInt("w_${c.topic}", weight(c.topic) + 2)
             "less" -> e.putInt("w_${c.topic}", maxOf(0, weight(c.topic) - 2))
             "surprised" -> e.putInt("w_${c.topic}", weight(c.topic) + 1)
+            "toohard" -> e.putInt("lvl_${c.topic}", maxOf(0, lvl(c.topic) - 1))
+            "tooeasy" -> e.putInt("lvl_${c.topic}", minOf(2, lvl(c.topic) + 1))
             "favourite" -> {
                 val arr = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
                 arr.put(JSONObject().put("topic", c.topic).put("card", c.json))
@@ -603,8 +689,28 @@ class MainActivity : Activity() {
             "more" -> "Noted: more ${c.topic}."
             "less" -> "Noted: less ${c.topic}."
             "surprised" -> "Noted: that surprised you."
+            "toohard" -> "Noted: ${c.topic} cards will be easier (now ${LEVELS[lvl(c.topic)]})."
+            "tooeasy" -> "Noted: ${c.topic} cards will be harder (now ${LEVELS[lvl(c.topic)]})."
             else -> "Saved to favourites."
         }
+    }
+
+    private fun adoptTopic() {
+        val c = current ?: return
+        val sel = selected()
+        if (sel.contains(c.topic)) { statusView.text = "${c.topic} is already in your interests."; return }
+        prefs.edit().putString("tags", (sel + c.topic).joinToString("|"))
+            .putString("blocked", blockedList().filter { it != c.topic }.joinToString("|"))
+            .putInt("lvl_${c.topic}", c.level).apply()
+        if (c.flags.add("adopt")) logEvent("adopt", "DISCOVER", 2)
+        exportPrefs()
+        statusView.text = "Added ${c.topic} to your interests (${LEVELS[c.level]})."
+    }
+
+    private fun notForMe() {
+        val c = current ?: return
+        prefs.edit().putString("blocked", (blockedList() + c.topic).distinct().joinToString("|")).apply()
+        statusView.text = "Noted: no more ${c.topic}."
     }
 
     private fun goDeeper() {
