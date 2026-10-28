@@ -39,7 +39,7 @@ object Net {
     /** Provider ids. Model names are unverified aliases; each list is tried in order. */
     val PROVIDERS = listOf("Groq", "Gemini", "OpenRouter")
 
-    private val GROQ_MODELS = listOf("openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant")
+    private val GROQ_MODELS = listOf("llama-3.3-70b-versatile", "openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.1-8b-instant")
     private val GEMINI_MODELS = listOf("gemini-flash-latest", "gemini-flash-lite-latest")
     private val OPENROUTER_MODELS = listOf("openrouter/free", "meta-llama/llama-3.3-70b-instruct:free")
 
@@ -106,12 +106,18 @@ object Net {
     }
 
     /** Tries each model with retries on busy errors. call(model) returns (code, body). */
-    private fun tryModels(models: List<String>, call: (String) -> Pair<Int, String>, extract: (String) -> String): String {
+    private fun tryModels(models: List<String>, needJson: Boolean, call: (String) -> Pair<Int, String>, extract: (String) -> String): String {
         var last = "no attempt"
         for (model in models) {
             for (attempt in 1..2) {
                 val (code, text) = call(model)
-                if (code == 200) return extract(text)
+                if (code == 200) {
+                    val out = try { extract(text) } catch (e: Exception) { "" }
+                    val ok = out.isNotBlank() && (!needJson || try { extractJson(out); true } catch (e: Exception) { false })
+                    if (ok) return out
+                    last = "$model replied but empty or no valid JSON (first 80 chars: ${out.take(80)})"
+                    break                                   // try the next model
+                }
                 last = "$model HTTP $code: ${text.take(160)}"
                 if (code == 404 || code == 400) break          // bad model name: next model
                 if (code != 429 && code != 500 && code != 503) throw RuntimeException(last)
@@ -121,11 +127,11 @@ object Net {
         throw RuntimeException(last)
     }
 
-    private fun gemini(key: String, prompt: String): String {
+    private fun gemini(key: String, prompt: String, needJson: Boolean): String {
         val req = JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
             .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
-        return tryModels(GEMINI_MODELS, { m ->
+        return tryModels(GEMINI_MODELS, needJson, { m ->
             postJson("https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent",
                 mapOf("x-goog-api-key" to key), req.toString())
         }, { t ->
@@ -134,11 +140,12 @@ object Net {
         })
     }
 
-    private fun openAiStyle(url: String, key: String, models: List<String>, prompt: String): String {
+    private fun openAiStyle(url: String, key: String, models: List<String>, prompt: String, needJson: Boolean): String {
         try {
-            return tryModels(models, { m ->
-                val req = JSONObject().put("model", m)
-                    .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+            return tryModels(models, needJson, { m ->
+                val req = JSONObject().put("model", m).put("max_tokens", 2000)
+                if (m.startsWith("openai/gpt-oss")) req.put("reasoning_effort", "low")
+                req.put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
                 postJson(url, mapOf("Authorization" to "Bearer $key"), req.toString())
             }, { t ->
                 JSONObject(t).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
@@ -158,20 +165,20 @@ object Net {
     }
 
     /** Ask one provider. Returns raw model text. */
-    fun ask(provider: String, key: String, prompt: String): String = when (provider) {
-        "Gemini" -> gemini(key, prompt)
-        "Groq" -> openAiStyle("https://api.groq.com/openai/v1/chat/completions", key, GROQ_MODELS, prompt)
-        "OpenRouter" -> openAiStyle("https://openrouter.ai/api/v1/chat/completions", key, OPENROUTER_MODELS, prompt)
+    fun ask(provider: String, key: String, prompt: String, needJson: Boolean = false): String = when (provider) {
+        "Gemini" -> gemini(key, prompt, needJson)
+        "Groq" -> openAiStyle("https://api.groq.com/openai/v1/chat/completions", key, GROQ_MODELS, prompt, needJson)
+        "OpenRouter" -> openAiStyle("https://openrouter.ai/api/v1/chat/completions", key, OPENROUTER_MODELS, prompt, needJson)
         else -> throw RuntimeException("Unknown provider $provider")
     }
 
     /** Auto: tries every provider that has a key, in order. Returns Pair(providerUsed, text). */
-    fun askAuto(keys: Map<String, String>, prompt: String): Pair<String, String> {
+    fun askAuto(keys: Map<String, String>, prompt: String, needJson: Boolean = false): Pair<String, String> {
         val errors = StringBuilder()
         for (p in PROVIDERS) {
             val k = keys[p] ?: ""
             if (k.isEmpty()) continue
-            try { return Pair(p, ask(p, k, prompt)) }
+            try { return Pair(p, ask(p, k, prompt, needJson)) }
             catch (e: Exception) { errors.append("$p: ${e.javaClass.simpleName}: ${e.message}\n") }
         }
         throw RuntimeException(if (errors.isEmpty()) "No keys saved." else "All providers failed:\n$errors")

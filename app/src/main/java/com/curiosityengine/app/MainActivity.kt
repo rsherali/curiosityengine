@@ -3,7 +3,13 @@ package com.curiosityengine.app
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.view.MotionEvent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -36,6 +42,113 @@ class Card(val topic: String, val kind: String, val via: String, val pillar: Str
 }
 
 class Week(val pts: Map<String, Int>, val reveals: Int, val done: Int, val skipped: Int, val days: Int)
+
+/** The flower home screen: one petal per pillar, length = minutes this week, dashed outline = target. */
+class FlowerView(
+    ctx: Context,
+    private val names: List<String>,
+    private val mins: List<Int>,
+    private val live: List<Boolean>,
+    private val colors: List<Int>,
+    private val focusIdx: Int,
+    private val target: Int,
+    private val onTap: (Int) -> Unit          // 0..5 = pillar, -1 = centre
+) : View(ctx) {
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = Color.parseColor("#5F6B7A"); strokeWidth = 2f }
+    private val dash = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.parseColor("#888780"); strokeWidth = 2f
+        pathEffect = DashPathEffect(floatArrayOf(8f, 8f), 0f)
+    }
+    private val focusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.parseColor("#1A237E"); strokeWidth = 4f
+        pathEffect = DashPathEffect(floatArrayOf(14f, 8f), 0f)
+    }
+    private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#1b1b1b") }
+    private val oval = RectF()
+
+    private fun k() = width / 680f * 1.3f
+
+    override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+        val w = MeasureSpec.getSize(widthSpec)
+        setMeasuredDimension(w, (w * 0.62f * 1.3f).toInt())
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val k = k()
+        val cx = width / 2f
+        val cy = height / 2f
+        val base = 28f * k
+        val lmax = 108f * k
+        val ry = 26f * k
+        for (i in 0 until 6) {
+            canvas.save()
+            canvas.translate(cx, cy)
+            canvas.rotate(-90f + 60f * i)
+            oval.set(base, -ry, base + lmax, ry)
+            canvas.drawOval(oval, if (i == focusIdx) focusPaint else dash)
+            val m = mins[i]
+            fill.color = colors[i]
+            if (m > 0) {
+                val l = maxOf(14f * k, lmax * minOf(m, target) / target)
+                oval.set(base, -ry, base + l, ry)
+                canvas.drawOval(oval, fill)
+                canvas.drawOval(oval, line)
+            } else {
+                canvas.drawCircle(base + 8f * k, 0f, 7f * k, fill)
+                canvas.drawCircle(base + 8f * k, 0f, 7f * k, line)
+            }
+            canvas.restore()
+        }
+        fill.color = Color.parseColor("#F1EFE8")
+        canvas.drawCircle(cx, cy, 34f * k, fill)
+        canvas.drawCircle(cx, cy, 34f * k, line)
+        txt.textAlign = Paint.Align.CENTER
+        txt.typeface = Typeface.DEFAULT_BOLD
+        txt.textSize = 20f * k
+        canvas.drawText(mins.sum().toString(), cx, cy - 1f * k, txt)
+        txt.typeface = Typeface.DEFAULT
+        txt.textSize = 13f * k
+        canvas.drawText("min", cx, cy + 17f * k, txt)
+
+        val r = 172f * k
+        for (i in 0 until 6) {
+            val rad = Math.toRadians((-90.0 + 60.0 * i))
+            val c = Math.cos(rad).toFloat()
+            var x = cx + r * c
+            val y = cy + r * Math.sin(rad).toFloat()
+            txt.textAlign = Paint.Align.CENTER
+            if (c > 0.3f) { txt.textAlign = Paint.Align.LEFT; x -= 22f * k }
+            else if (c < -0.3f) { txt.textAlign = Paint.Align.RIGHT; x += 22f * k }
+            txt.color = Color.parseColor("#1b1b1b")
+            txt.typeface = Typeface.DEFAULT_BOLD
+            txt.textSize = 16f * k
+            canvas.drawText(names[i], x, y - 2f * k, txt)
+            txt.typeface = Typeface.DEFAULT
+            txt.textSize = 13f * k
+            canvas.drawText("${mins[i]} min" + (if (live[i]) "" else " (soon)"), x, y + 15f * k, txt)
+            if (i == focusIdx) {
+                txt.color = Color.parseColor("#1A237E")
+                txt.typeface = Typeface.DEFAULT_BOLD
+                canvas.drawText("FOCUS", x, y + 31f * k, txt)
+            }
+        }
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (e.action == MotionEvent.ACTION_UP) {
+            val dx = e.x - width / 2f
+            val dy = e.y - height / 2f
+            val dist = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+            if (dist < 34f * k()) onTap(-1) else {
+                val ang = Math.toDegrees(Math.atan2(dy.toDouble(), dx.toDouble()))
+                val rel = ((ang + 120.0) % 360.0 + 360.0) % 360.0
+                onTap((rel / 60.0).toInt().coerceIn(0, 5))
+            }
+        }
+        return true
+    }
+}
 
 class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("ce_prefs", Context.MODE_PRIVATE) }
@@ -81,15 +194,11 @@ class MainActivity : Activity() {
     private lateinit var hookView: TextView
     private lateinit var questionView: TextView
     private lateinit var answerView: TextView
-    private lateinit var deeperView: TextView
     private lateinit var revealBtn: Button
     private lateinit var guessField: EditText
     private lateinit var actionView: TextView
     private lateinit var actionRow: LinearLayout
     private lateinit var explainerView: TextView
-    private lateinit var hintBtn: Button
-    private lateinit var hintView: TextView
-    private lateinit var discoverRow: LinearLayout
 
     // ---------- backup: survives uninstall (shared storage, not app storage) ----------
     private fun backupFile(): java.io.File =
@@ -258,49 +367,29 @@ class MainActivity : Activity() {
         return r
     }
 
-    // ---------- HOME (pillar dashboard) ----------
+    // ---------- HOME (flower) ----------
     private fun showHome() {
         val root = vertical()
         val w = weekly()
         val focus = focusPillar(w)
         val total = PILLARS.sumOf { w.pts[it] ?: 0 }
         root.addView(text("Curiosity Engine", 26f, true))
-        root.addView(text("Minutes invested this week. Target: $WEEKLY_TARGET min per pillar.", 13f))
-        root.addView(text(if (total == 0) "Nothing logged yet. Start with $focus." else "Focus: $focus (least time this week).", 16f, true))
-
-        var i = 0
-        while (i < PILLARS.size) {
-            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            for (p in listOf(PILLARS[i], PILLARS[i + 1])) {
-                val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                lp.setMargins(dp(4), dp(4), dp(4), dp(4))
-                r.addView(tile(p, w, focus), lp)
-            }
-            root.addView(r)
-            i += 2
-        }
-        root.addView(row(btn("Weekly review") { showReview() }, btn("Interests") { showInterests() }))
-        root.addView(row(btn("Favourites") { showFavourites() }, btn("Settings") { showSettings() }))
+        root.addView(text(if (total == 0) "Nothing logged yet. Tap a petal to start. Today's focus: $focus." else "Focus: $focus (least time this week). Tap a petal.", 15f, true))
+        val flower = FlowerView(
+            this, PILLARS, PILLARS.map { w.pts[it] ?: 0 }, PILLARS.map { it in LIVE },
+            PILLARS.map { Color.parseColor(statusColor(w.pts[it] ?: 0)) }, PILLARS.indexOf(focus), WEEKLY_TARGET,
+            { idx -> if (idx < 0) showReview() else openSection(PILLARS[idx]) }
+        )
+        root.addView(flower, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(text("Petal length = minutes this week. Dashed outline = $WEEKLY_TARGET-minute target. Tap the centre for the weekly review.", 12f))
+        root.addView(row(
+            btn("Review") { showReview() },
+            btn("Interests") { showInterests() },
+            btn("Favourites") { showFavourites() },
+            btn("Settings") { showSettings() }
+        ))
         root.addView(text("Build v${version()}", 11f))
         screen("home", root)
-    }
-
-    private fun tile(p: String, w: Week, focus: String): LinearLayout {
-        val m = w.pts[p] ?: 0
-        val t = vertical()
-        t.setPadding(dp(12), dp(12), dp(12), dp(12))
-        t.minimumHeight = dp(150)
-        t.setBackgroundColor(Color.parseColor(if (p == focus && (w.pts.values.sum() > 0 || true)) "#FFF3CD" else "#EEF1F8"))
-        t.addView(text(p, 18f, true))
-        t.addView(text(PURPOSE[p] ?: "", 12f))
-        t.addView(text("$m / $WEEKLY_TARGET min", 15f, true))
-        t.addView(bar(m), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)))
-        t.addView(text(statusLabel(m), 12f))
-        val tag = (if (p == focus) "FOCUS THIS WEEK  " else "") + (if (p in LIVE) "" else "Coming soon")
-        if (tag.isNotBlank()) t.addView(text(tag.trim(), 11f, true))
-        t.isClickable = true
-        t.setOnClickListener { openSection(p) }
-        return t
     }
 
     private fun openSection(p: String) {
@@ -405,7 +494,7 @@ class MainActivity : Activity() {
         hookView = text("", 22f, true)
         questionView = text("", 18f)
         answerView = text("", 16f).apply { visibility = View.GONE }
-        deeperView = text("", 15f).apply { visibility = View.GONE }
+        explainerView = text("", 16f).apply { visibility = View.GONE }
         guessField = EditText(this).apply {
             hint = when (mode) {
                 "THINK" -> "Your answer (needed to earn THINK minutes)"
@@ -413,44 +502,19 @@ class MainActivity : Activity() {
                 else -> "Your guess (optional)"
             }
         }
-        explainerView = text("", 16f).apply { visibility = View.GONE }
-        hintView = text("", 15f).apply { visibility = View.GONE }
-        hintBtn = btn("Give me a hint") {
-            val c = current
-            if (c != null) { c.flags.add("hint"); applyState(c) }
-        }.apply { visibility = View.GONE }
-        discoverRow = row(
-            btn("Look it up") { val c = current; if (c != null) openUrl("https://www.google.com/search?q=" + Uri.encode(c.json.optString("search", c.topic))) },
-            btn("Add to my interests") { adoptTopic() },
-            btn("Not for me") { notForMe() }
-        )
         revealBtn = btn("Show answer") { reveal() }
         actionView = text("", 16f, true)
-        actionRow = row(
-            btn("I did it") { actionResult("done") },
-            btn("Not today") { actionResult("skip") }
-        )
+        actionRow = row(btn("I did it") { actionResult("done") })
 
         root.addView(topicView); root.addView(statusView)
         root.addView(hookView); root.addView(explainerView); root.addView(questionView)
-        root.addView(hintBtn); root.addView(hintView)
         root.addView(guessField); root.addView(revealBtn); root.addView(answerView)
-        root.addView(discoverRow)
         root.addView(actionView); root.addView(actionRow)
         root.addView(row(
-            btn("More like this") { signal("more") },
-            btn("Less like this") { signal("less") },
+            btn("Like") { signal("more") },
+            btn("Not like") { signal("less") },
             btn("Favourite") { signal("favourite") }
         ))
-        root.addView(row(
-            btn("Go deeper") { goDeeper() },
-            btn("Surprised me") { signal("surprised") }
-        ))
-        root.addView(row(
-            btn("Too hard") { signal("toohard") },
-            btn("Too easy") { signal("tooeasy") }
-        ))
-        root.addView(deeperView)
         root.addView(btn("Next card") { loadNext() })
         screen("feed", root)
 
@@ -484,11 +548,11 @@ class MainActivity : Activity() {
         return Pair(pool[0], "preferred")
     }
 
-    private fun fetchText(prompt: String): Pair<String, String> {
+    private fun fetchText(prompt: String, needJson: Boolean = false): Pair<String, String> {
         val choice = prefs.getString("provider", "Auto") ?: "Auto"
-        if (choice == "Auto") return Net.askAuto(Net.PROVIDERS.associate { it to keyFor(it) }, prompt)
+        if (choice == "Auto") return Net.askAuto(Net.PROVIDERS.associate { it to keyFor(it) }, prompt, needJson)
         if (keyFor(choice).isEmpty()) throw RuntimeException("No $choice key saved. Open Settings.")
-        return Pair(choice, Net.ask(choice, keyFor(choice), prompt))
+        return Pair(choice, Net.ask(choice, keyFor(choice), prompt, needJson))
     }
 
     private fun levelText(level: Int) = when (level) {
@@ -506,14 +570,13 @@ class MainActivity : Activity() {
             "LEARN" -> "This is a TEACHING card. 'explainer' is 4-5 clear sentences that teach the idea; the learner reads it first. " +
                 "'question' is a short check question answerable from the explainer; 'answer' is its correct answer (1-2 sentences). "
             "THINK" -> "This is a BRAIN CHALLENGE card: a logic puzzle, estimation, pattern, or reasoning problem related to the topic, " +
-                "solvable by reasoning without obscure facts. 'question' states the whole challenge; 'answer' gives the solution with brief reasoning; " +
-                "'hint' is a nudge that does not give the answer away. "
+                "solvable by reasoning without obscure facts. 'question' states the whole challenge; 'answer' gives the solution with brief reasoning. "
             else -> "This is a DISCOVERY card that tempts the learner toward something new. 'hook' is a vivid teaser; 'answer' is a 2-sentence taste of the topic; " +
                 "'question' is a wondering question; 'search' is a 3-6 word web search to explore it. "
         }
         val keys = when (m) {
             "LEARN" -> "hook, explainer, question, answer, fact, action, minutes"
-            "THINK" -> "hook, question, hint, answer, fact, action, minutes"
+            "THINK" -> "hook, question, answer, fact, action, minutes"
             else -> "hook, question, answer, fact, search, action, minutes"
         }
         val prompt = "You are a curiosity coach. Create one card about: $topic. Difficulty level: ${levelText(level)} $extra" +
@@ -523,7 +586,7 @@ class MainActivity : Activity() {
             "'action' is one small real-world action under 20 words that exercises the $m pillar: ${HINT[m]}; " +
             "link it to the topic where natural; doable today without special equipment. " +
             "'minutes' is an integer from 1 to 15: realistic minutes the action takes."
-        val (via, raw) = fetchText(prompt)
+        val (via, raw) = fetchText(prompt, true)
         val j = Net.extractJson(raw)
         val c = Card(topic, kind, via, m, j)
         c.level = level
@@ -547,6 +610,11 @@ class MainActivity : Activity() {
 
     private fun loadNext() {
         if (loading) return
+        val prev = current
+        if (prev != null && prev.revealed && prev.actionState == null) {
+            prev.actionState = "skip"                 // moved on without doing the action
+            logEvent("action_skip", prev.pillar, 0)
+        }
         val n = next
         if (n != null) { next = null; show(n); prefetch(); return }
         loading = true
@@ -581,19 +649,12 @@ class MainActivity : Activity() {
             if (c.flags.add("viewed")) logEvent("view", "DISCOVER", 1)
         }
         applyState(c)
-        val d = c.deeper
-        if (d != null) { deeperView.text = d; deeperView.visibility = View.VISIBLE } else deeperView.visibility = View.GONE
     }
 
     private fun applyState(c: Card) {
         val j = c.json
         val p = c.pillar
         explainerView.visibility = if (p == "LEARN") View.VISIBLE else View.GONE
-        discoverRow.visibility = if (p == "DISCOVER") View.VISIBLE else View.GONE
-        val hinted = c.flags.contains("hint")
-        hintView.text = "HINT\n" + j.optString("hint")
-        hintView.visibility = if (p == "THINK" && hinted) View.VISIBLE else View.GONE
-        hintBtn.visibility = if (p == "THINK" && !c.revealed && !hinted) View.VISIBLE else View.GONE
         if (!c.revealed) {
             guessField.visibility = View.VISIBLE; revealBtn.visibility = View.VISIBLE
             answerView.visibility = View.GONE; actionView.visibility = View.GONE; actionRow.visibility = View.GONE
@@ -606,7 +667,7 @@ class MainActivity : Activity() {
         answerView.visibility = View.VISIBLE
         val st = c.actionState
         actionView.text = "TRY TODAY (${c.pillar}, about ${c.minutes} min)\n${j.optString("action")}" +
-            (if (st == "done") "\n[Done - logged]" else if (st == "skip") "\n[Skipped - logged]" else "")
+            (if (st == "done") "\n[Done - logged]" else if (st == "skip") "\n[Not done - logged]" else "")
         actionView.visibility = View.VISIBLE
         actionRow.visibility = if (st == null) View.VISIBLE else View.GONE
     }
@@ -624,7 +685,7 @@ class MainActivity : Activity() {
         applyState(c)
     }
 
-    /** Asks the model to judge the typed guess and shows feedback. A real attempt earns 1 THINK minute. */
+    /** Asks the model to judge the typed guess and shows feedback. A real attempt earns THINK minutes. */
     private fun judgeGuess(c: Card) {
         val j = c.json
         val prompt = "A learner was asked a question and typed a guess before seeing the answer. Judge the guess fairly. " +
@@ -636,7 +697,7 @@ class MainActivity : Activity() {
             var verdict = "error"
             var fb = "Could not check your guess (no connection), but the effort counts."
             try {
-                val (_, raw) = fetchText(prompt)
+                val (_, raw) = fetchText(prompt, true)
                 val o = Net.extractJson(raw)
                 verdict = o.optString("verdict")
                 fb = o.optString("feedback")
@@ -661,50 +722,47 @@ class MainActivity : Activity() {
             logEvent("action_done", c.pillar, c.minutes)
             if (c.pillar != "CONFIDENCE") logEvent("action_conf", "CONFIDENCE", 1)
             statusView.text = "Logged: ${c.minutes} min of ${c.pillar}."
-        } else {
-            logEvent("action_skip", c.pillar, 0)
-            statusView.text = "Skip logged. The weekly review will remember."
         }
         applyState(c)
     }
 
+    /** Like / Not like / Favourite. In DISCOVER, Like adds the topic to your interests and Not like blocks it. */
     private fun signal(kind: String) {
         val c = current ?: return
         val e = prefs.edit()
         e.putInt("n_$kind", prefs.getInt("n_$kind", 0) + 1)
+        var saved = false
         when (kind) {
             "more" -> e.putInt("w_${c.topic}", weight(c.topic) + 2)
             "less" -> e.putInt("w_${c.topic}", maxOf(0, weight(c.topic) - 2))
-            "surprised" -> e.putInt("w_${c.topic}", weight(c.topic) + 1)
-            "toohard" -> e.putInt("lvl_${c.topic}", maxOf(0, lvl(c.topic) - 1))
-            "tooeasy" -> e.putInt("lvl_${c.topic}", minOf(2, lvl(c.topic) + 1))
-            "favourite" -> {
+            "favourite" -> if (c.flags.add("fav")) {
                 val arr = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
                 arr.put(JSONObject().put("topic", c.topic).put("card", c.json))
                 e.putString("favs", arr.toString())
+                saved = true
             }
         }
         e.apply()
         statusView.text = when (kind) {
-            "more" -> "Noted: more ${c.topic}."
+            "more" -> "Liked: more ${c.topic}."
             "less" -> "Noted: less ${c.topic}."
-            "surprised" -> "Noted: that surprised you."
-            "toohard" -> "Noted: ${c.topic} cards will be easier (now ${LEVELS[lvl(c.topic)]})."
-            "tooeasy" -> "Noted: ${c.topic} cards will be harder (now ${LEVELS[lvl(c.topic)]})."
-            else -> "Saved to favourites."
+            else -> if (saved) "Saved to favourites." else "Already in favourites."
+        }
+        if (c.pillar == "DISCOVER") {
+            if (kind == "more") adoptTopic() else if (kind == "less") notForMe()
         }
     }
 
     private fun adoptTopic() {
         val c = current ?: return
         val sel = selected()
-        if (sel.contains(c.topic)) { statusView.text = "${c.topic} is already in your interests."; return }
+        if (sel.contains(c.topic)) { statusView.text = "Liked. ${c.topic} is already in your interests."; return }
         prefs.edit().putString("tags", (sel + c.topic).joinToString("|"))
             .putString("blocked", blockedList().filter { it != c.topic }.joinToString("|"))
             .putInt("lvl_${c.topic}", c.level).apply()
         if (c.flags.add("adopt")) logEvent("adopt", "DISCOVER", 2)
         exportPrefs()
-        statusView.text = "Added ${c.topic} to your interests (${LEVELS[c.level]})."
+        statusView.text = "Liked. Added ${c.topic} to your interests (${LEVELS[c.level]})."
     }
 
     private fun notForMe() {
@@ -713,44 +771,75 @@ class MainActivity : Activity() {
         statusView.text = "Noted: no more ${c.topic}."
     }
 
-    private fun goDeeper() {
-        val c = current ?: return
-        if (c.deeper != null) return
-        statusView.text = "Going deeper..."
-        val j = c.json
-        val prompt = "Explain more about this for a curious adult in about 200 words of plain text (no markdown, no lists). " +
-            "Topic: ${c.topic}. Question: ${j.optString("question")}. Short answer so far: ${j.optString("answer")}. " +
-            "End with one suggestion for what to explore next."
-        Thread {
-            try {
-                val (_, raw) = fetchText(prompt)
-                runOnUiThread {
-                    c.deeper = "GO DEEPER\n" + raw.trim()
-                    if (c.flags.add("deeper")) logEvent("deeper", c.pillar, 3)
-                    if (current === c) { deeperView.text = c.deeper; deeperView.visibility = View.VISIBLE; statusView.text = "" }
-                }
-            } catch (e: Exception) {
-                runOnUiThread { statusView.text = "FAIL: ${e.javaClass.simpleName}: ${e.message}" }
-            }
-        }.start()
+    // ---------- Weekly review ----------
+    private fun dailyGrid(): Array<IntArray> {
+        val arr = try { JSONArray(prefs.getString("log", "[]")) } catch (x: Exception) { JSONArray() }
+        val off = java.util.TimeZone.getDefault().rawOffset.toLong()
+        val today = (System.currentTimeMillis() + off) / 86400000L
+        val g = Array(6) { IntArray(7) }
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val d = (o.optLong("t") + off) / 86400000L
+            val col = 6 - (today - d).toInt()
+            val pi = PILLARS.indexOf(o.optString("p"))
+            if (col in 0..6 && pi >= 0) g[pi][col] += o.optInt("m", o.optInt("pts"))
+        }
+        return g
     }
 
-    // ---------- Weekly review ----------
+    private fun dayColor(m: Int) = when {
+        m == 0 -> "#EEEEEE"
+        m < 3 -> "#F8D7DA"
+        m < 6 -> "#FFE8B3"
+        m < 10 -> "#E2F0CB"
+        else -> "#C8E6C9"
+    }
+
     private fun showReview() {
         val root = vertical()
         root.addView(btn("Back to home") { showHome() })
-        root.addView(text("Weekly review: last 7 days", 24f, true))
+        root.addView(text("Weekly review", 24f, true))
         val w = weekly()
-        root.addView(text("Target: $WEEKLY_TARGET minutes per pillar per week.", 13f))
-        for (p in PILLARS) {
-            val m = w.pts[p] ?: 0
-            root.addView(text("$p: $m min - ${statusLabel(m)}", 16f, true))
-            root.addView(bar(m), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)))
+        val g = dailyGrid()
+        root.addView(text("Minutes per day, last 7 days (today is on the right). Target: $WEEKLY_TARGET min per pillar per week.", 13f))
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        head.addView(TextView(this), LinearLayout.LayoutParams(dp(100), ViewGroup.LayoutParams.WRAP_CONTENT))
+        for (c in 0..6) {
+            val cc = java.util.Calendar.getInstance()
+            cc.add(java.util.Calendar.DAY_OF_YEAR, -(6 - c))
+            val letter = "SMTWTFS"[cc.get(java.util.Calendar.DAY_OF_WEEK) - 1].toString()
+            head.addView(TextView(this).apply { text = letter; gravity = Gravity.CENTER; textSize = 12f },
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
+        head.addView(TextView(this), LinearLayout.LayoutParams(dp(86), ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(head)
+        for (pi in PILLARS.indices) {
+            val p = PILLARS[pi]
+            val m = w.pts[p] ?: 0
+            val rowView = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            rowView.addView(TextView(this).apply { text = p; textSize = 13f; setTypeface(typeface, Typeface.BOLD) },
+                LinearLayout.LayoutParams(dp(100), ViewGroup.LayoutParams.WRAP_CONTENT))
+            for (c in 0..6) {
+                val v = g[pi][c]
+                val cell = TextView(this).apply {
+                    text = if (v == 0) "-" else v.toString()
+                    textSize = 13f; gravity = Gravity.CENTER
+                    setTextColor(Color.parseColor("#1b1b1b"))
+                    setBackgroundColor(Color.parseColor(dayColor(v)))
+                }
+                val lp = LinearLayout.LayoutParams(0, dp(40), 1f)
+                lp.setMargins(dp(1), dp(1), dp(1), dp(1))
+                rowView.addView(cell, lp)
+            }
+            rowView.addView(TextView(this).apply { text = "$m min\n${statusLabel(m)}"; textSize = 11f; gravity = Gravity.CENTER },
+                LinearLayout.LayoutParams(dp(86), ViewGroup.LayoutParams.WRAP_CONTENT))
+            root.addView(rowView)
+        }
+        root.addView(text("Day colours: grey none, pink under 3 min, amber 3-5, light green 6-9, green 10 or more. Numbers show the minutes.", 12f))
         root.addView(text("Honest take", 18f, true))
         root.addView(text(honestTake(w), 16f))
-        root.addView(text("Minutes logged: reveal 1; real guess 1 (THINK); non-preferred topic 1 (DISCOVER); " +
-            "go deeper 3; action done = its estimated minutes (+1 CONFIDENCE); manual logs as entered.", 12f))
+        root.addView(text("Minutes logged: reveal 1; real answer 1-2 (THINK); non-preferred topic 1 (DISCOVER); " +
+            "action done = its estimated minutes (+1 CONFIDENCE); Next without doing the action counts as skipped; manual logs as entered.", 12f))
         var armed = false
         val reset = Button(this)
         reset.text = "Reset stats"
