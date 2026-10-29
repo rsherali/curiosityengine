@@ -4,6 +4,13 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Canvas
+import android.graphics.Path
+import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
+import android.view.ViewTreeObserver
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
@@ -43,6 +50,67 @@ class Card(val topic: String, val kind: String, val via: String, val pillar: Str
 
 class Week(val pts: Map<String, Int>, val reveals: Int, val done: Int, val skipped: Int, val days: Int)
 
+/** Illustrated card header: pillar colour, soft circles, a white pillar glyph, and the topic name. */
+class HeaderArt(ctx: Context, private val color: Int, private val pillar: String,
+                private val topic: String, private val sub: String) : View(ctx) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val path = Path()
+    override fun onMeasure(w: Int, h: Int) {
+        val ww = MeasureSpec.getSize(w)
+        setMeasuredDimension(ww, (ww * 0.24f).toInt())
+    }
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        p.style = Paint.Style.FILL
+        p.color = color; p.alpha = 255
+        c.drawRect(0f, 0f, w, h, p)
+        p.color = Color.WHITE; p.alpha = 38
+        c.drawCircle(w * 0.86f, h * 0.2f, h * 0.9f, p)
+        c.drawCircle(w * 0.97f, h * 1.0f, h * 0.7f, p)
+        c.drawCircle(w * 0.52f, h * 1.2f, h * 0.55f, p)
+        p.alpha = 255
+        val gx = w * 0.85f; val gy = h * 0.5f; val r = h * 0.3f
+        when (pillar) {
+            "THINK" -> {
+                c.drawCircle(gx, gy - r * 0.15f, r * 0.62f, p)
+                c.drawRoundRect(RectF(gx - r * 0.28f, gy + r * 0.5f, gx + r * 0.28f, gy + r * 0.85f), r * 0.1f, r * 0.1f, p)
+            }
+            "LEARN" -> {
+                path.reset()
+                path.moveTo(gx - r, gy - r * 0.55f); path.lineTo(gx - r * 0.06f, gy - r * 0.3f)
+                path.lineTo(gx - r * 0.06f, gy + r * 0.75f); path.lineTo(gx - r, gy + r * 0.5f); path.close()
+                c.drawPath(path, p)
+                path.reset()
+                path.moveTo(gx + r, gy - r * 0.55f); path.lineTo(gx + r * 0.06f, gy - r * 0.3f)
+                path.lineTo(gx + r * 0.06f, gy + r * 0.75f); path.lineTo(gx + r, gy + r * 0.5f); path.close()
+                c.drawPath(path, p)
+            }
+            "DISCOVER" -> {
+                path.reset()
+                path.moveTo(gx, gy - r); path.lineTo(gx + r * 0.28f, gy - r * 0.28f)
+                path.lineTo(gx + r, gy); path.lineTo(gx + r * 0.28f, gy + r * 0.28f)
+                path.lineTo(gx, gy + r); path.lineTo(gx - r * 0.28f, gy + r * 0.28f)
+                path.lineTo(gx - r, gy); path.lineTo(gx - r * 0.28f, gy - r * 0.28f); path.close()
+                c.drawPath(path, p)
+            }
+            else -> c.drawCircle(gx, gy, r * 0.7f, p)
+        }
+        p.color = Color.WHITE
+        p.textAlign = Paint.Align.LEFT
+        p.alpha = 210
+        p.typeface = Typeface.DEFAULT_BOLD
+        p.textSize = h * 0.12f
+        c.drawText(pillar, h * 0.18f, h * 0.27f, p)
+        p.alpha = 255
+        p.textSize = h * 0.21f
+        c.drawText(topic, h * 0.18f, h * 0.58f, p)
+        p.typeface = Typeface.DEFAULT
+        p.alpha = 225
+        p.textSize = h * 0.115f
+        c.drawText(sub, h * 0.18f, h * 0.82f, p)
+    }
+}
+
 /** The flower home screen: one petal per pillar, length = minutes this week, dashed outline = target. */
 class FlowerView(
     ctx: Context,
@@ -50,6 +118,7 @@ class FlowerView(
     private val mins: List<Int>,
     private val live: List<Boolean>,
     private val colors: List<Int>,
+    private val accents: List<Int>,
     private val focusIdx: Int,
     private val target: Int,
     private val onTap: (Int) -> Unit          // 0..5 = pillar, -1 = centre
@@ -67,11 +136,12 @@ class FlowerView(
     private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#1b1b1b") }
     private val oval = RectF()
 
-    private fun k() = width / 680f * 1.3f
+    private fun k() = minOf(width / 440f, height / 415f)
 
     override fun onMeasure(widthSpec: Int, heightSpec: Int) {
         val w = MeasureSpec.getSize(widthSpec)
-        setMeasuredDimension(w, (w * 0.62f * 1.3f).toInt())
+        val h = if (MeasureSpec.getMode(heightSpec) == MeasureSpec.UNSPECIFIED) (w * 0.9f).toInt() else MeasureSpec.getSize(heightSpec)
+        setMeasuredDimension(w, h)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -89,6 +159,8 @@ class FlowerView(
             canvas.drawOval(oval, if (i == focusIdx) focusPaint else dash)
             val m = mins[i]
             fill.color = colors[i]
+            line.color = accents[i]
+            line.strokeWidth = 3f * k
             if (m > 0) {
                 val l = maxOf(14f * k, lmax * minOf(m, target) / target)
                 oval.set(base, -ry, base + l, ry)
@@ -100,6 +172,8 @@ class FlowerView(
             }
             canvas.restore()
         }
+        line.color = Color.parseColor("#5F6B7A")
+        line.strokeWidth = 2f
         fill.color = Color.parseColor("#F1EFE8")
         canvas.drawCircle(cx, cy, 34f * k, fill)
         canvas.drawCircle(cx, cy, 34f * k, line)
@@ -190,14 +264,20 @@ class MainActivity : Activity() {
     private val recentHooks = ArrayList<String>()
 
     private lateinit var statusView: TextView
-    private lateinit var topicView: TextView
     private lateinit var hookView: TextView
     private lateinit var questionView: TextView
     private lateinit var answerView: TextView
     private lateinit var revealBtn: Button
     private lateinit var guessField: EditText
-    private lateinit var actionView: TextView
-    private lateinit var actionRow: LinearLayout
+    private lateinit var headerWrap: LinearLayout
+    private lateinit var dock: LinearLayout
+    private lateinit var scroll: ScrollView
+    private lateinit var explainerCard: LinearLayout
+    private lateinit var answerCard: LinearLayout
+    private lateinit var thoughtCard: LinearLayout
+    private lateinit var thoughtView: TextView
+    private var kbUp = false
+    private var kbListener: ViewTreeObserver.OnGlobalLayoutListener? = null
     private lateinit var explainerView: TextView
 
     // ---------- backup: survives uninstall (shared storage, not app storage) ----------
@@ -255,25 +335,102 @@ class MainActivity : Activity() {
     private fun blockedList(): List<String> = (prefs.getString("blocked", "") ?: "").split("|").filter { it.isNotEmpty() }
     private fun wildTopics(): List<String> = WILD.filter { !blockedList().contains(it) }.ifEmpty { WILD }
 
+    private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+    private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+    private val BRAND = Color.parseColor("#3F51B5")
+    private val BG = Color.parseColor("#F5F7FA")
+    private val PCOLOR = mapOf(
+        "THINK" to "#3949AB", "LEARN" to "#00796B", "MOVE" to "#EF6C00",
+        "ENGAGE" to "#C2185B", "DISCOVER" to "#7B1FA2", "CONFIDENCE" to "#B26A00"
+    )
+    private fun pc(p: String) = Color.parseColor(PCOLOR[p] ?: "#3F51B5")
+
+    /** Text size multiplier: 0 normal, 1 large (default), 2 extra large. */
+    private fun fs(): Float = when (prefs.getInt("fs", 1)) { 0 -> 1.15f; 2 -> 1.65f; else -> 1.4f }
+
     private fun text(t: String, size: Float, bold: Boolean = false) = TextView(this).apply {
-        text = t; textSize = size
-        if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+        text = t; textSize = size * fs()
+        if (bold) setTypeface(typeface, Typeface.BOLD)
+        setLineSpacing(0f, 1.15f)
+        setTextColor(Color.parseColor("#212121"))
         setPadding(0, dp(4), 0, dp(4))
     }
 
-    private fun btn(t: String, onClick: () -> Unit) = Button(this).apply {
-        text = t; minHeight = dp(48); setOnClickListener { onClick() }
+    private fun darken(c: Int): Int {
+        val hsv = FloatArray(3)
+        Color.colorToHSV(c, hsv)
+        hsv[2] = hsv[2] * 0.8f
+        return Color.HSVToColor(hsv)
+    }
+
+    private fun btn(t: String, primary: Boolean = false, color: Int = BRAND, onClick: () -> Unit) = Button(this).apply {
+        text = t; textSize = 15f * fs(); minHeight = dp(56)
+        val r = dp(14).toFloat()
+        fun shape(fillC: Int, strokeC: Int) = GradientDrawable().apply { setColor(fillC); cornerRadius = r; setStroke(dp(2), strokeC) }
+        val normal = if (primary) shape(color, color) else shape(Color.WHITE, color)
+        val pressed = if (primary) shape(darken(color), darken(color)) else shape(Color.parseColor("#E8EAF6"), color)
+        val sl = StateListDrawable()
+        sl.addState(intArrayOf(android.R.attr.state_pressed), pressed)
+        sl.addState(intArrayOf(), normal)
+        background = sl
+        setTextColor(if (primary) Color.WHITE else color)
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        setOnClickListener { onClick() }
     }
 
     private fun row(vararg buttons: Button): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
-        for (b in buttons) addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        for (b in buttons) {
+            val lp = LinearLayout.LayoutParams(0, WRAP, 1f)
+            lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+            addView(b, lp)
+        }
+    }
+
+    private fun card(accent: Int? = null): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = GradientDrawable().apply {
+            setColor(Color.WHITE); cornerRadius = dp(16).toFloat()
+            setStroke(dp(if (accent != null) 2 else 1), accent ?: Color.parseColor("#E0E0E0"))
+        }
+        setPadding(dp(16), dp(12), dp(16), dp(12))
+    }
+
+    private fun put(parent: LinearLayout, v: View, top: Int = 10) {
+        val lp = LinearLayout.LayoutParams(MATCH, WRAP)
+        lp.setMargins(0, dp(top), 0, 0)
+        parent.addView(v, lp)
+    }
+
+    private fun hideKeyboard() {
+        try {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            val v = currentFocus ?: window.decorView
+            imm.hideSoftInputFromWindow(v.windowToken, 0)
+            currentFocus?.clearFocus()
+        } catch (e: Exception) { }
+    }
+
+    private fun removeKb() {
+        val l = kbListener
+        if (l != null) {
+            try { window.decorView.viewTreeObserver.removeOnGlobalLayoutListener(l) } catch (e: Exception) { }
+            kbListener = null
+        }
+        kbUp = false
+    }
+
+    private fun setRoot(name: String, v: View) {
+        screenName = name
+        hideKeyboard()
+        removeKb()
+        v.setBackgroundColor(BG)
+        setContentView(v)
     }
 
     private fun screen(name: String, content: LinearLayout) {
-        screenName = name
         content.setPadding(dp(16), dp(16), dp(16), dp(16))
-        setContentView(ScrollView(this).apply { addView(content) })
+        setRoot(name, ScrollView(this).apply { addView(content) })
     }
 
     private fun vertical() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -367,9 +524,9 @@ class MainActivity : Activity() {
         return r
     }
 
-    // ---------- HOME (flower) ----------
+    // ---------- HOME (flower, fills the screen) ----------
     private fun showHome() {
-        val root = vertical()
+        val root = vertical().apply { setPadding(dp(14), dp(12), dp(14), dp(10)) }
         val w = weekly()
         val focus = focusPillar(w)
         val total = PILLARS.sumOf { w.pts[it] ?: 0 }
@@ -377,19 +534,20 @@ class MainActivity : Activity() {
         root.addView(text(if (total == 0) "Nothing logged yet. Tap a petal to start. Today's focus: $focus." else "Focus: $focus (least time this week). Tap a petal.", 15f, true))
         val flower = FlowerView(
             this, PILLARS, PILLARS.map { w.pts[it] ?: 0 }, PILLARS.map { it in LIVE },
-            PILLARS.map { Color.parseColor(statusColor(w.pts[it] ?: 0)) }, PILLARS.indexOf(focus), WEEKLY_TARGET,
+            PILLARS.map { Color.parseColor(statusColor(w.pts[it] ?: 0)) }, PILLARS.map { pc(it) },
+            PILLARS.indexOf(focus), WEEKLY_TARGET,
             { idx -> if (idx < 0) showReview() else openSection(PILLARS[idx]) }
         )
-        root.addView(flower, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(text("Petal length = minutes this week. Dashed outline = $WEEKLY_TARGET-minute target. Tap the centre for the weekly review.", 12f))
+        root.addView(flower, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        root.addView(text("Petal length = minutes this week. Dashed outline = $WEEKLY_TARGET-minute target. Tap the centre for the weekly review.", 11f))
         root.addView(row(
             btn("Review") { showReview() },
             btn("Interests") { showInterests() },
             btn("Favourites") { showFavourites() },
             btn("Settings") { showSettings() }
         ))
-        root.addView(text("Build v${version()}", 11f))
-        screen("home", root)
+        root.addView(text("Build v${version()}", 10f))
+        setRoot("home", root)
     }
 
     private fun openSection(p: String) {
@@ -447,7 +605,7 @@ class MainActivity : Activity() {
             root.addView(text(cat, 18f, true))
             for (t in tags) {
                 val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-                val cb = CheckBox(this).apply { text = t; isChecked = chosen.contains(t) }
+                val cb = CheckBox(this).apply { text = t; isChecked = chosen.contains(t); textSize = 17f * fs() }
                 val sp = Spinner(this)
                 sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, LEVELS)
                 sp.setSelection(lvl(t))
@@ -460,7 +618,7 @@ class MainActivity : Activity() {
         }
         val msg = text("", 14f)
         root.addView(msg)
-        root.addView(btn("Save & continue") {
+        root.addView(btn("Save & continue", true) {
             val picked = rows.filter { it.cb.isChecked }
             if (picked.isEmpty()) { msg.text = "Pick at least one interest." } else {
                 val names = picked.map { it.tag }
@@ -482,41 +640,87 @@ class MainActivity : Activity() {
 
     // ---------- Section feed (LEARN / THINK / DISCOVER) ----------
     private fun showFeed() {
-        val root = vertical()
-        root.addView(row(
-            btn("Home") { showHome() },
-            btn("Favourites") { showFavourites() }
-        ))
-        root.addView(strip())
-        root.addView(text("$mode: ${PURPOSE[mode]}", 18f, true))
-        topicView = text("", 13f)
+        val pcol = pc(mode)
+        val outer = vertical()
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), dp(8), dp(8), dp(2)) }
+        bar.addView(btn("Home") { showHome() }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        bar.addView(text(mode, 18f, true).apply { gravity = Gravity.CENTER; setTextColor(pcol) }, LinearLayout.LayoutParams(0, WRAP, 1.2f))
+        bar.addView(btn("Favourites") { showFavourites() }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        outer.addView(bar)
+        val stripView = strip()
+        val slp = LinearLayout.LayoutParams(MATCH, WRAP)
+        slp.setMargins(dp(8), 0, dp(8), dp(4))
+        outer.addView(stripView, slp)
+
+        scroll = ScrollView(this)
+        val content = vertical().apply { setPadding(dp(14), dp(6), dp(14), dp(14)) }
+        headerWrap = LinearLayout(this)
+        content.addView(headerWrap, LinearLayout.LayoutParams(MATCH, WRAP))
         statusView = text("", 13f)
         hookView = text("", 22f, true)
-        questionView = text("", 18f)
-        answerView = text("", 16f).apply { visibility = View.GONE }
-        explainerView = text("", 16f).apply { visibility = View.GONE }
+        explainerView = text("", 17f)
+        questionView = text("", 19f)
+        answerView = text("", 17f)
+        thoughtView = text("", 16f).apply { setTypeface(typeface, Typeface.ITALIC) }
+        explainerCard = card().apply { addView(explainerView) }
+        val questionCard = card(pcol).apply { addView(questionView) }
+        answerCard = card().apply { addView(answerView) }
+        thoughtCard = card().apply { addView(thoughtView) }
         guessField = EditText(this).apply {
             hint = when (mode) {
-                "THINK" -> "Your answer (needed to earn THINK minutes)"
-                "LEARN" -> "Your answer to the check question (optional)"
-                else -> "Your guess (optional)"
+                "THINK" -> "Tap here to type your answer (earns THINK minutes)"
+                "LEARN" -> "Tap here to type your answer (optional)"
+                else -> "Tap here to type your guess (optional)"
+            }
+            textSize = 19f * fs()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            setHorizontallyScrolling(false)
+            minLines = 2; maxLines = 4
+            setOnEditorActionListener { _, actionId, _ -> if (actionId == EditorInfo.IME_ACTION_DONE) { hideKeyboard(); true } else false }
+        }
+        revealBtn = btn("Show answer", true, pcol) { reveal() }
+
+        content.addView(statusView)
+        put(content, hookView, 4)
+        put(content, explainerCard)
+        put(content, questionCard)
+        put(content, guessField, 6)
+        put(content, revealBtn, 6)
+        put(content, answerCard)
+        put(content, thoughtCard)
+        scroll.addView(content)
+        outer.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+
+        dock = vertical().apply { setPadding(dp(8), dp(4), dp(8), dp(8)); setBackgroundColor(Color.WHITE) }
+        dock.addView(row(
+            btn("Like", false, pcol) { signal("more") },
+            btn("Not like", false, pcol) { signal("less") },
+            btn("Favourite", false, pcol) { signal("favourite") }
+        ))
+        put(dock, btn("Next card", true, pcol) { loadNext() }, 4)
+        outer.addView(dock)
+        setRoot("feed", outer)
+
+        // keyboard: appears only when the answer box is tapped; while typing, hide the header, strip and dock
+        // so the question and the box stay visible; close it on Show answer / Next / Done.
+        outer.isFocusableInTouchMode = true
+        outer.requestFocus()
+        val decor = window.decorView
+        val l = ViewTreeObserver.OnGlobalLayoutListener {
+            val r = Rect()
+            decor.getWindowVisibleDisplayFrame(r)
+            val screenH = decor.rootView.height
+            val up = screenH - r.bottom > screenH * 0.15f
+            if (up != kbUp) {
+                kbUp = up
+                val vis = if (up) View.GONE else View.VISIBLE
+                dock.visibility = vis; headerWrap.visibility = vis; stripView.visibility = vis
+                if (up) scroll.post { scroll.scrollTo(0, hookView.top) }
             }
         }
-        revealBtn = btn("Show answer") { reveal() }
-        actionView = text("", 16f, true)
-        actionRow = row(btn("I did it") { actionResult("done") })
-
-        root.addView(topicView); root.addView(statusView)
-        root.addView(hookView); root.addView(explainerView); root.addView(questionView)
-        root.addView(guessField); root.addView(revealBtn); root.addView(answerView)
-        root.addView(actionView); root.addView(actionRow)
-        root.addView(row(
-            btn("Like") { signal("more") },
-            btn("Not like") { signal("less") },
-            btn("Favourite") { signal("favourite") }
-        ))
-        root.addView(btn("Next card") { loadNext() })
-        screen("feed", root)
+        decor.viewTreeObserver.addOnGlobalLayoutListener(l)
+        kbListener = l
 
         val c = current
         if (c != null) show(c) else loadNext()
@@ -575,23 +779,19 @@ class MainActivity : Activity() {
                 "'question' is a wondering question; 'search' is a 3-6 word web search to explore it. "
         }
         val keys = when (m) {
-            "LEARN" -> "hook, explainer, question, answer, fact, action, minutes"
-            "THINK" -> "hook, question, answer, fact, action, minutes"
-            else -> "hook, question, answer, fact, search, action, minutes"
+            "LEARN" -> "hook, explainer, question, answer, fact, action"
+            "THINK" -> "hook, question, answer, fact, action"
+            else -> "hook, question, answer, fact, search, action"
         }
         val prompt = "You are a curiosity coach. Create one card about: $topic. Difficulty level: ${levelText(level)} $extra" +
             "Make it surprising and specific. Avoid repeating these earlier hooks: $avoid. " +
             "Reply with ONLY a JSON object with these keys: $keys. All values are strings except minutes. " +
             "'fact' is one surprising related fact. 'hook' is one intriguing sentence. " +
-            "'action' is one small real-world action under 20 words that exercises the $m pillar: ${HINT[m]}; " +
-            "link it to the topic where natural; doable today without special equipment. " +
-            "'minutes' is an integer from 1 to 15: realistic minutes the action takes."
+            "'action' is one short inspiring thought or idea to carry into real life today, under 20 words, related to the topic."
         val (via, raw) = fetchText(prompt, true)
         val j = Net.extractJson(raw)
         val c = Card(topic, kind, via, m, j)
         c.level = level
-        val mins = j.optInt("minutes", 5)
-        c.minutes = if (mins < 1) 5 else minOf(mins, 30)
         return c
     }
 
@@ -610,11 +810,7 @@ class MainActivity : Activity() {
 
     private fun loadNext() {
         if (loading) return
-        val prev = current
-        if (prev != null && prev.revealed && prev.actionState == null) {
-            prev.actionState = "skip"                 // moved on without doing the action
-            logEvent("action_skip", prev.pillar, 0)
-        }
+        hideKeyboard()
         val n = next
         if (n != null) { next = null; show(n); prefetch(); return }
         loading = true
@@ -634,10 +830,12 @@ class MainActivity : Activity() {
         current = c
         val j = c.json
         recentHooks.add(j.optString("hook"))
-        topicView.text = "${c.topic} (${c.kind}) | ${LEVELS[c.level]} | via ${c.via}"
+        headerWrap.removeAllViews()
+        headerWrap.addView(HeaderArt(this, pc(c.pillar), c.pillar, c.topic, "${LEVELS[c.level]}  |  ${c.kind}  |  via ${c.via}"),
+            LinearLayout.LayoutParams(MATCH, WRAP))
         statusView.text = ""
         hookView.text = j.optString("hook")
-        explainerView.text = "EXPLAINER\n" + j.optString("explainer")
+        explainerView.text = j.optString("explainer")
         questionView.text = when (c.pillar) {
             "LEARN" -> "CHECK YOURSELF\n"
             "THINK" -> "CHALLENGE\n"
@@ -649,32 +847,31 @@ class MainActivity : Activity() {
             if (c.flags.add("viewed")) logEvent("view", "DISCOVER", 1)
         }
         applyState(c)
+        scroll.post { scroll.scrollTo(0, 0) }
     }
 
     private fun applyState(c: Card) {
         val j = c.json
         val p = c.pillar
-        explainerView.visibility = if (p == "LEARN") View.VISIBLE else View.GONE
+        explainerCard.visibility = if (p == "LEARN") View.VISIBLE else View.GONE
+        thoughtView.text = "A THOUGHT FOR TODAY\n" + j.optString("action")
         if (!c.revealed) {
             guessField.visibility = View.VISIBLE; revealBtn.visibility = View.VISIBLE
-            answerView.visibility = View.GONE; actionView.visibility = View.GONE; actionRow.visibility = View.GONE
+            answerCard.visibility = View.GONE; thoughtCard.visibility = View.GONE
             return
         }
         guessField.visibility = View.GONE; revealBtn.visibility = View.GONE
         val label = when (p) { "DISCOVER" -> "A TASTE"; "THINK" -> "SOLUTION"; else -> "ANSWER" }
         val g = if (c.guess.isNotEmpty()) "YOUR ANSWER\n${c.guess}\n${c.feedback}\n\n" else ""
         answerView.text = g + "$label\n${j.optString("answer")}\n\nFACT\n${j.optString("fact")}"
-        answerView.visibility = View.VISIBLE
-        val st = c.actionState
-        actionView.text = "TRY TODAY (${c.pillar}, about ${c.minutes} min)\n${j.optString("action")}" +
-            (if (st == "done") "\n[Done - logged]" else if (st == "skip") "\n[Not done - logged]" else "")
-        actionView.visibility = View.VISIBLE
-        actionRow.visibility = if (st == null) View.VISIBLE else View.GONE
+        answerCard.visibility = View.VISIBLE
+        thoughtCard.visibility = View.VISIBLE
     }
 
     private fun reveal() {
         val c = current ?: return
         if (c.revealed) return
+        hideKeyboard()
         c.guess = guessField.text.toString().trim()
         c.revealed = true
         val think = c.pillar == "THINK"
@@ -683,6 +880,7 @@ class MainActivity : Activity() {
         if (c.kind != "preferred" && c.pillar != "DISCOVER") logEvent("explore", "DISCOVER", 1)
         if (c.guess.isNotEmpty()) { c.feedback = "Checking your guess..."; judgeGuess(c) }
         applyState(c)
+        scroll.post { scroll.scrollTo(0, hookView.top) }
     }
 
     /** Asks the model to judge the typed guess and shows feedback. A real attempt earns THINK minutes. */
@@ -712,18 +910,6 @@ class MainActivity : Activity() {
                 if (current === c) applyState(c)
             }
         }.start()
-    }
-
-    private fun actionResult(state: String) {
-        val c = current ?: return
-        if (c.actionState != null) return
-        c.actionState = state
-        if (state == "done") {
-            logEvent("action_done", c.pillar, c.minutes)
-            if (c.pillar != "CONFIDENCE") logEvent("action_conf", "CONFIDENCE", 1)
-            statusView.text = "Logged: ${c.minutes} min of ${c.pillar}."
-        }
-        applyState(c)
     }
 
     /** Like / Not like / Favourite. In DISCOVER, Like adds the topic to your interests and Not like blocks it. */
@@ -803,7 +989,7 @@ class MainActivity : Activity() {
         val g = dailyGrid()
         root.addView(text("Minutes per day, last 7 days (today is on the right). Target: $WEEKLY_TARGET min per pillar per week.", 13f))
         val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        head.addView(TextView(this), LinearLayout.LayoutParams(dp(100), ViewGroup.LayoutParams.WRAP_CONTENT))
+        head.addView(TextView(this), LinearLayout.LayoutParams(dp(130), ViewGroup.LayoutParams.WRAP_CONTENT))
         for (c in 0..6) {
             val cc = java.util.Calendar.getInstance()
             cc.add(java.util.Calendar.DAY_OF_YEAR, -(6 - c))
@@ -811,19 +997,19 @@ class MainActivity : Activity() {
             head.addView(TextView(this).apply { text = letter; gravity = Gravity.CENTER; textSize = 12f },
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
-        head.addView(TextView(this), LinearLayout.LayoutParams(dp(86), ViewGroup.LayoutParams.WRAP_CONTENT))
+        head.addView(TextView(this), LinearLayout.LayoutParams(dp(100), ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(head)
         for (pi in PILLARS.indices) {
             val p = PILLARS[pi]
             val m = w.pts[p] ?: 0
             val rowView = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-            rowView.addView(TextView(this).apply { text = p; textSize = 13f; setTypeface(typeface, Typeface.BOLD) },
-                LinearLayout.LayoutParams(dp(100), ViewGroup.LayoutParams.WRAP_CONTENT))
+            rowView.addView(TextView(this).apply { text = p; textSize = 13f * fs(); setTypeface(typeface, Typeface.BOLD) },
+                LinearLayout.LayoutParams(dp(130), ViewGroup.LayoutParams.WRAP_CONTENT))
             for (c in 0..6) {
                 val v = g[pi][c]
                 val cell = TextView(this).apply {
                     text = if (v == 0) "-" else v.toString()
-                    textSize = 13f; gravity = Gravity.CENTER
+                    textSize = 13f * fs(); gravity = Gravity.CENTER
                     setTextColor(Color.parseColor("#1b1b1b"))
                     setBackgroundColor(Color.parseColor(dayColor(v)))
                 }
@@ -831,15 +1017,15 @@ class MainActivity : Activity() {
                 lp.setMargins(dp(1), dp(1), dp(1), dp(1))
                 rowView.addView(cell, lp)
             }
-            rowView.addView(TextView(this).apply { text = "$m min\n${statusLabel(m)}"; textSize = 11f; gravity = Gravity.CENTER },
-                LinearLayout.LayoutParams(dp(86), ViewGroup.LayoutParams.WRAP_CONTENT))
+            rowView.addView(TextView(this).apply { text = "$m min\n${statusLabel(m)}"; textSize = 11f * fs(); gravity = Gravity.CENTER },
+                LinearLayout.LayoutParams(dp(100), ViewGroup.LayoutParams.WRAP_CONTENT))
             root.addView(rowView)
         }
         root.addView(text("Day colours: grey none, pink under 3 min, amber 3-5, light green 6-9, green 10 or more. Numbers show the minutes.", 12f))
         root.addView(text("Honest take", 18f, true))
         root.addView(text(honestTake(w), 16f))
-        root.addView(text("Minutes logged: reveal 1; real answer 1-2 (THINK); non-preferred topic 1 (DISCOVER); " +
-            "action done = its estimated minutes (+1 CONFIDENCE); Next without doing the action counts as skipped; manual logs as entered.", 12f))
+        root.addView(text("Minutes logged: reveal 1; real answer 1-2 (THINK); non-preferred topic 1 (DISCOVER); adding an interest 2; " +
+            "manual logs as entered. Move, Engage and Confidence fill up once those sections are built.", 12f))
         var armed = false
         val reset = Button(this)
         reset.text = "Reset stats"
@@ -853,12 +1039,10 @@ class MainActivity : Activity() {
     }
 
     private fun honestTake(w: Week): String {
-        if (w.reveals + w.done + w.skipped + w.pts.values.sum() == 0) return "Nothing logged in the last 7 days. That is not enough to say anything yet. Open a pillar."
+        if (w.reveals + w.pts.values.sum() == 0) return "Nothing logged in the last 7 days. That is not enough to say anything yet. Open a pillar."
         val lines = ArrayList<String>()
-        lines.add("Cards explored: ${w.reveals}. Actions done: ${w.done}. Actions skipped: ${w.skipped}. Active ${w.days} of 7 days.")
-        if (w.reveals >= 5 && w.done == 0) lines.add("You have read a lot and done nothing. Knowing is not doing.")
-        else if (w.skipped > w.done && w.skipped >= 3) lines.add("You have skipped more actions than you have done.")
-        else if (w.done >= 3) lines.add("Good: you are actually doing things, not just reading.")
+        lines.add("Cards explored: ${w.reveals}. Active ${w.days} of 7 days.")
+        if (w.days <= 2 && w.reveals > 0) lines.add("Only ${w.days} active day(s) so far. Little and often beats one big burst.")
         val low = PILLARS.filter { (w.pts[it] ?: 0) < WEEKLY_TARGET / 2 }
         if (low.size >= 4) lines.add("Not enough across ${low.size} of 6 pillars: ${low.joinToString(", ")}.")
         else if (low.isNotEmpty()) lines.add("Weak spots: ${low.joinToString(", ")}.")
@@ -887,6 +1071,17 @@ class MainActivity : Activity() {
         root.addView(btn("Back to home") { showHome() })
         root.addView(text("Settings", 24f, true))
         root.addView(text("Build v${version()} | Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})", 13f))
+        root.addView(text("Text size", 14f))
+        val fsSpinner = Spinner(this)
+        fsSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, listOf("Normal", "Large", "Extra large"))
+        fsSpinner.setSelection(prefs.getInt("fs", 1))
+        fsSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                if (pos != prefs.getInt("fs", 1)) { prefs.edit().putInt("fs", pos).apply(); exportPrefs(); showSettings() }
+            }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+        root.addView(fsSpinner)
         val choices = listOf("Auto") + Net.PROVIDERS
         root.addView(text("Provider (Auto = try every saved key)", 14f))
         val spinner = Spinner(this)
