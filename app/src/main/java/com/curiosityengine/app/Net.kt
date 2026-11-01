@@ -8,6 +8,7 @@ import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.Socket
 import java.net.URL
+import java.net.URLEncoder
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
@@ -185,6 +186,43 @@ object Net {
             catch (e: Exception) { errors.append("$p: ${e.javaClass.simpleName}: ${e.message}\n") }
         }
         throw RuntimeException(if (errors.isEmpty()) "No keys saved." else "All providers failed:\n$errors")
+    }
+
+    /** GET with TLS fallback. Throws unless the server answers 200. Wikimedia asks for a descriptive User-Agent. */
+    fun httpGet(url: String): String {
+        fun once(conscrypt: Boolean): String {
+            val c = open(url, conscrypt)
+            c.setRequestProperty("User-Agent", "CuriosityEngine/0.1 (personal learning app on Android 4.4)")
+            c.setRequestProperty("Accept", "application/json")
+            val code = c.responseCode
+            val st = if (code < 400) c.inputStream else c.errorStream
+            val text = st?.let { BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() } } ?: ""
+            c.disconnect()
+            if (code != 200) throw RuntimeException("HTTP $code from ${URL(url).host}")
+            return text
+        }
+        return try { once(false) } catch (e: javax.net.ssl.SSLException) { once(true) }
+    }
+
+    /** Intro text of an English Wikipedia article: Pair(resolved title, text), or null if missing or ambiguous. */
+    fun wikiExtract(title: String): Pair<String, String>? {
+        if (title.isBlank()) return null
+        val u = "https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&format=json&titles=" +
+            URLEncoder.encode(title, "UTF-8")
+        val pages = JSONObject(httpGet(u)).getJSONObject("query").getJSONObject("pages")
+        val key = pages.keys().next()
+        if (key == "-1") return null
+        val pg = pages.getJSONObject(key)
+        val ex = pg.optString("extract").trim()
+        if (ex.length < 250 || ex.contains("may refer to")) return null
+        return Pair(pg.optString("title", title), ex.take(3500))
+    }
+
+    /** Top search hit title on English Wikipedia, or null. */
+    fun wikiSearch(q: String): String? {
+        val u = "https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=1&format=json&srsearch=" + URLEncoder.encode(q, "UTF-8")
+        val arr = JSONObject(httpGet(u)).getJSONObject("query").getJSONArray("search")
+        return if (arr.length() > 0) arr.getJSONObject(0).optString("title") else null
     }
 
     /** Pulls the JSON object out of text that may include code fences or chatter. */

@@ -48,10 +48,52 @@ class Card(val topic: String, val kind: String, val via: String, val pillar: Str
     var correct = -1
     var chosen = -1                          // -1 unanswered, 0..2 option tapped, -2 typed answer
     var checked = true                       // false if the reviewer pass was unavailable
+    var convo: Convo? = null
     var minutes = 5
     var level = 0
     var actionState: String? = null          // "done" or "skip"
     val flags = HashSet<String>()            // once-per-card events already logged
+}
+
+/** A saved/explorable conversation about one card: deeper explainer from a source, then follow-ups. */
+class Convo(val id: Long, var fav: Boolean, val pillar: String, val topic: String, val level: Int,
+            val hook: String, val tell: String, val takeaway: String, val wiki: String) {
+    var headline = ""
+    var body = ""
+    var source = ""
+    var extract = ""
+    val turns = ArrayList<Pair<String, String>>()
+    var chips: List<String> = emptyList()
+    @Volatile var loading = false
+    @Volatile var asking = false
+    var error = ""
+
+    fun toJson(): JSONObject {
+        val t = JSONArray()
+        for ((q, a) in turns) t.put(JSONObject().put("q", q).put("a", a))
+        val c = JSONArray()
+        for (x in chips) c.put(x)
+        return JSONObject().put("id", id).put("fav", fav).put("pillar", pillar).put("topic", topic).put("level", level)
+            .put("hook", hook).put("tell", tell).put("takeaway", takeaway).put("wiki", wiki)
+            .put("headline", headline).put("body", body).put("source", source).put("extract", extract)
+            .put("turns", t).put("chips", c)
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject): Convo {
+            val cv = Convo(o.optLong("id"), o.optBoolean("fav"), o.optString("pillar"), o.optString("topic"), o.optInt("level"),
+                o.optString("hook"), o.optString("tell"), o.optString("takeaway"), o.optString("wiki"))
+            cv.headline = o.optString("headline"); cv.body = o.optString("body")
+            cv.source = o.optString("source"); cv.extract = o.optString("extract")
+            val t = o.optJSONArray("turns")
+            if (t != null) for (i in 0 until t.length()) cv.turns.add(Pair(t.getJSONObject(i).optString("q"), t.getJSONObject(i).optString("a")))
+            val c = o.optJSONArray("chips")
+            val list = ArrayList<String>()
+            if (c != null) for (i in 0 until c.length()) list.add(c.optString(i))
+            cv.chips = list
+            return cv
+        }
+    }
 }
 
 class Week(val pts: Map<String, Int>, val reveals: Int, val done: Int, val skipped: Int, val days: Int)
@@ -283,6 +325,9 @@ class MainActivity : Activity() {
     private lateinit var questionCard: LinearLayout
     private lateinit var optionsBox: LinearLayout
     private lateinit var typeBtn: Button
+    private lateinit var moreBtn: Button
+    private var currentConvo: Convo? = null
+    private var convoReturn: () -> Unit = { }
     private var testPlan: List<Pair<String, Int>> = emptyList()
     private var testIdx = 0
     private val testResults = ArrayList<JSONObject>()
@@ -330,6 +375,7 @@ class MainActivity : Activity() {
     override fun onPause() { super.onPause(); exportPrefs() }
 
     override fun onBackPressed() {
+        if (screenName == "convo") { convoReturn(); return }
         if (screenName != "home" && selected().isNotEmpty()) showHome() else super.onBackPressed()
     }
 
@@ -679,7 +725,9 @@ class MainActivity : Activity() {
         explainerCard = card().apply { addView(explainerView) }
         optionsBox = vertical()
         questionCard = card(pcol).apply { addView(questionView); addView(optionsBox) }
+        moreBtn = btn("More about this  >", false, pcol) { openMore() }
         answerCard = card().apply { addView(answerView) }
+        put(answerCard, moreBtn, 10)
         thoughtCard = card().apply { addView(thoughtView) }
         guessField = EditText(this).apply {
             hint = "Type your answer"
@@ -775,14 +823,15 @@ class MainActivity : Activity() {
     }
 
     private fun levelRules(level: Int) = when (level) {
-        0 -> "BEGINNER. One simple idea in everyday words: no jargon, no dates, no numbers beyond simple counts. " +
-            "The 'tell' must contain everything needed, so someone who knows nothing about the topic can answer correctly just by reading it. " +
-            "The question must be answerable from the 'tell' alone. Wrong options must be clearly wrong, never tricky. " +
-            "GOOD example (topic: Space): tell 'The Moon is slowly drifting away from the Earth, by a few centimetres every year.' " +
-            "question 'Over millions of years, what is the Moon doing?' options ['Moving slowly away from Earth', 'Moving slowly closer to Earth', 'Staying exactly where it is']. " +
-            "BAD examples: 'What is the Chandrasekhar limit?' (needs specialist knowledge); 'Which statement is true?' (vague)."
-        1 -> "INTERMEDIATE. Assume general knowledge of the topic; basic terms are fine. The question may need one step of reasoning from the 'tell'. Wrong options are plausible but definitely wrong."
-        else -> "ADVANCED. Assume a solid background; technical terms are fine. The question applies the idea to a new case. Still exactly one defensible answer; wrong options are plausible but definitely wrong."
+        0 -> "BEGINNER: the reader is an intelligent adult who is new to this topic. Use plain words and explain any technical term in passing, " +
+            "but treat them as smart: real ideas, no childish framing, no counting or trivial examples. The question should make them think for a moment " +
+            "and be answerable from the ideas in the 'tell' plus common sense. Wrong options must be clearly wrong on reflection, never tricks. " +
+            "BAD: trivial questions (for example counting fingers), vague questions ('Which statement is true?'), questions comparing unrelated things, " +
+            "questions that need specialist knowledge. " +
+            "GOOD (topic: Space): question 'Sunlight takes about 8 minutes to reach us. If the Sun vanished right now, when would we notice?' " +
+            "options ['After about 8 minutes', 'Immediately', 'After about 8 hours']."
+        1 -> "INTERMEDIATE: assume general knowledge of the topic; basic terms are fine. The question may need one step of reasoning from the 'tell'. Wrong options are plausible but definitely wrong."
+        else -> "ADVANCED: assume a solid background; technical terms are fine. The question applies the idea to a new case. Still exactly one defensible answer; wrong options are plausible but definitely wrong."
     }
 
     private val MC_RULES = "'question' = ONE clear question (under 25 words). 'options' = exactly 3 short answers (under 12 words each); exactly ONE is correct and defensible; " +
@@ -800,17 +849,21 @@ class MainActivity : Activity() {
             "LEVEL RULES: ${levelRules(level)} " +
             "ACCURACY RULES: use only well-established facts you are certain of (textbook or encyclopaedia level). " +
             "Never use 'latest', 'record', 'currently' or statistics that change. Avoid exact numbers, dates and obscure names unless essential and certain. " +
-            "If unsure, choose a simpler, safer fact. Avoid repeating these earlier hooks: $avoid. "
+            "If unsure, choose a simpler, safer fact. Every statement and comparison must make sense to a thoughtful adult. Avoid repeating these earlier hooks: $avoid. "
         val body = when (m) {
-            "LEARN" -> "Write a TEACHING card. 'tell' = 3 or 4 short plain sentences explaining one idea. " + MC_RULES
+            "LEARN" -> "Write a TEACHING card built around a surprise, a puzzle or a common misconception. 'tell' = about 120 to 150 words in 2 short paragraphs that explain the idea well " +
+                "in plain language, with one concrete everyday comparison. Then 'question': ask something that tests UNDERSTANDING, not memory of the wording: ask the reader to predict what would happen, " +
+                "apply the idea to a new everyday case, or choose the right explanation over a common misconception. The 'tell' gives the ideas but must NOT contain the answer as a sentence. " +
+                "If you cannot write a genuinely good question, set 'question' to an empty string, 'options' to an empty array, 'correct' to 0 and 'why' to an empty string. " + MC_RULES
             "THINK" -> "Write a BRAIN CHALLENGE card. Theme it on $topic where natural, but it must be solvable from the 'tell' alone. " +
                 THINK_TEMPLATES[rnd.nextInt(THINK_TEMPLATES.size)] + " " + MC_RULES
             else -> "Write a DISCOVERY card that tempts the reader toward something new. 'tell' = 3 or 4 vivid, accurate sentences. There is no question."
         }
-        val keys = if (m == "DISCOVER") "hook, tell, takeaway, action" else "hook, tell, question, options, correct, why, takeaway, action"
+        val keys = if (m == "DISCOVER") "hook, tell, takeaway, action, wiki" else "hook, tell, question, options, correct, why, takeaway, action, wiki"
         return common + body + " Also: 'hook' = one intriguing sentence of at most 20 words; 'takeaway' = one sentence the reader could say to a friend, at most 25 words; " +
-            "'action' = one short inspiring thought to carry into real life today, under 20 words. " +
-            "Reply with ONLY a JSON object with these keys: $keys. All values are strings except 'options' (array of exactly 3 strings) and 'correct' (integer 0, 1 or 2)."
+            "'action' = one short inspiring thought to carry into real life today, under 20 words; " +
+            "'wiki' = the exact title of the English Wikipedia article about this idea (a real, well-known article, for example 'Speed of light'). " +
+            "Reply with ONLY a JSON object with these keys: $keys. All values are strings except 'options' (array of strings) and 'correct' (integer 0, 1 or 2)."
     }
 
     /** Returns null if the card is structurally sound, otherwise the problem. */
@@ -818,9 +871,12 @@ class MainActivity : Activity() {
         for (k in listOf("hook", "tell", "takeaway", "action")) if (j.optString(k).isBlank()) return "missing $k"
         val changing = Regex("(?i)\\b(latest|newest|currently|as of|record-breaking)\\b")
         if (changing.containsMatchIn(j.optString("tell") + " " + j.optString("question"))) return "uses changing facts"
+        val words = j.optString("tell").trim().split(Regex("\\s+")).size
+        if (m == "LEARN" && (words < 70 || words > 240)) return "explainer length ($words words)"
         if (m == "DISCOVER") return null
         val q = j.optString("question")
-        if (q.isBlank() || q.length > 220) return "bad question"
+        if (q.isBlank()) return if (m == "LEARN") null else "no question"
+        if (q.length > 220) return "question too long"
         if (j.optString("why").isBlank()) return "missing why"
         val arr = j.optJSONArray("options") ?: return "no options"
         if (arr.length() != 3) return "options not 3"
@@ -835,16 +891,23 @@ class MainActivity : Activity() {
         return null
     }
 
-    /** Second model reviews the card. Returns null if it passes, else the problem. Throws if no reviewer is reachable. */
+    /** Second model reviews sense, interest, understanding and accuracy. Returns null if it passes, else the problem. */
     private fun checkCard(j: JSONObject, level: Int, via: String): String? {
-        val prompt = "You are a strict reviewer of quiz cards for a knowledge app. Card: $j (options are numbered from 0; 'correct' is the index the author says is right). " +
-            "Check: 1) the option marked correct is factually correct; 2) the other two options are definitely wrong; " +
-            "3) the question is clear, has exactly one defensible answer, and does not depend on changing facts; " +
-            (if (level == 0) "4) it is answerable from the 'tell' alone by someone who knows nothing about the topic; " else "4) the difficulty is sensible for the level; ") +
-            "5) any reasoning or arithmetic is right. Reply with ONLY a JSON object {\"ok\": true or false, \"problem\": \"short reason, or empty\"}. Be strict: if in doubt, ok=false."
+        val hasQ = j.optString("question").isNotBlank()
+        val prompt = "You are a strict reviewer of cards for a knowledge app for thoughtful adults. Card: $j (options are numbered from 0; 'correct' is the index the author says is right). " +
+            "Check the hook, the 'tell' and " + (if (hasQ) "the question: 1) the option marked correct is factually correct; 2) the other two options are definitely wrong; " +
+                "3) the question is clear, has exactly one defensible answer, and does not depend on changing facts; " +
+                (if (level == 0) "4) it is answerable from the ideas in the 'tell' plus common sense by someone new to the topic; " else "4) the difficulty is sensible for the level; ") +
+                "5) any reasoning or arithmetic is right. " else "the facts in it: every claim must be accurate. ") +
+            "Also score: sense (1 to 5): does the premise make sense, are the things compared genuinely related, would the hook and question mean something to a thoughtful adult; " +
+            "interest (1 to 5): is it genuinely interesting or worth telling someone; tests_understanding (true or false): does the question test understanding rather than finding a line in the text (true if there is no question). " +
+            "Reply with ONLY a JSON object {\"ok\": true or false, \"sense\": number, \"interest\": number, \"tests_understanding\": true or false, \"problem\": \"short reason, or empty\"}. Be strict: if in doubt, ok=false."
         val (_, raw) = fetchText(prompt, true, 0.1, true, via)
         val o = Net.extractJson(raw)
-        return if (o.optBoolean("ok", false)) null else o.optString("problem", "failed review").ifBlank { "failed review" }
+        val good = o.optBoolean("ok", false) && o.optInt("sense", 0) >= 4 && o.optInt("interest", 0) >= 3 && o.optBoolean("tests_understanding", true)
+        if (good) return null
+        val why = o.optString("problem")
+        return if (why.isNotBlank()) why else "scored low (sense ${o.optInt("sense", 0)}, interest ${o.optInt("interest", 0)})"
     }
 
     private fun fetchCard(m: String = mode, forceLevel: Int? = null): Card {
@@ -865,7 +928,7 @@ class MainActivity : Activity() {
             val c = Card(topic, kind, via, m, j)
             c.level = level
             c.checked = reviewed
-            if (m != "DISCOVER") {
+            if (m != "DISCOVER" && j.optString("question").isNotBlank()) {
                 val arr = j.getJSONArray("options")
                 val opts = (0..2).map { arr.getString(it).trim() }
                 val order = listOf(0, 1, 2).shuffled(rnd)        // models tend to put the right answer first
@@ -923,10 +986,11 @@ class MainActivity : Activity() {
         guessField.setText("")
         guessField.visibility = View.GONE
         revealBtn.visibility = View.GONE
-        typeBtn.visibility = if (c.pillar != "DISCOVER" && !c.revealed) View.VISIBLE else View.GONE
-        if (c.pillar == "DISCOVER" && !c.revealed) {
+        val hasQ = c.options.isNotEmpty()
+        typeBtn.visibility = if (hasQ && !c.revealed) View.VISIBLE else View.GONE
+        if (!hasQ && !c.revealed) {                      // nothing to answer: show the takeaway straight away
             c.revealed = true
-            if (c.flags.add("viewed")) logEvent("view", "DISCOVER", 1)
+            if (c.flags.add("viewed")) logEvent(if (c.pillar == "DISCOVER") "view" else "reveal", c.pillar, 1)
         }
         applyState(c)
         scroll.post { scroll.scrollTo(0, 0) }
@@ -934,7 +998,7 @@ class MainActivity : Activity() {
 
     private fun renderOptions(c: Card) {
         optionsBox.removeAllViews()
-        for (i in 0..2) {
+        for (i in c.options.indices) {
             val label = "${"ABC"[i]}.  ${c.options[i]}"
             val b: Button = when {
                 c.chosen == -1 -> btn(label, false, pc(c.pillar)) { choose(i) }
@@ -949,18 +1013,18 @@ class MainActivity : Activity() {
 
     private fun applyState(c: Card) {
         val j = c.json
-        val isD = c.pillar == "DISCOVER"
+        val hasQ = c.options.isNotEmpty()
         explainerCard.visibility = View.VISIBLE
-        questionCard.visibility = if (isD) View.GONE else View.VISIBLE
+        questionCard.visibility = if (hasQ) View.VISIBLE else View.GONE
         thoughtView.text = "A THOUGHT FOR TODAY\n" + j.optString("action")
-        if (!isD) renderOptions(c)
+        if (hasQ) renderOptions(c)
         if (!c.revealed) {
             answerCard.visibility = View.GONE; thoughtCard.visibility = View.GONE
             return
         }
         typeBtn.visibility = View.GONE; guessField.visibility = View.GONE; revealBtn.visibility = View.GONE
         val sb = StringBuilder()
-        if (!isD) {
+        if (hasQ) {
             if (c.chosen >= 0) {
                 sb.append(if (c.chosen == c.correct) "Correct!\n\n" else "Not quite. The answer is ${"ABC"[c.correct]}: ${c.options[c.correct]}\n\n")
             } else if (c.guess.isNotEmpty()) {
@@ -1038,22 +1102,22 @@ class MainActivity : Activity() {
         val c = current ?: return
         val e = prefs.edit()
         e.putInt("n_$kind", prefs.getInt("n_$kind", 0) + 1)
-        var saved = false
         when (kind) {
             "more" -> e.putInt("w_${c.topic}", weight(c.topic) + 2)
             "less" -> e.putInt("w_${c.topic}", maxOf(0, weight(c.topic) - 2))
-            "favourite" -> if (c.flags.add("fav")) {
-                val arr = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
-                arr.put(JSONObject().put("topic", c.topic).put("card", c.json))
-                e.putString("favs", arr.toString())
-                saved = true
-            }
         }
         e.apply()
+        var favMsg = ""
+        if (kind == "favourite") {
+            val cv = ensureConvo(c)
+            cv.fav = !cv.fav
+            persistConvo(cv)
+            favMsg = if (cv.fav) "Saved to favourites. Tap More about this to keep the conversation going." else "Removed from favourites."
+        }
         statusView.text = when (kind) {
             "more" -> "Liked: more ${c.topic}."
             "less" -> "Noted: less ${c.topic}."
-            else -> if (saved) "Saved to favourites." else "Already in favourites."
+            else -> favMsg
         }
         if (c.pillar == "DISCOVER") {
             if (kind == "more") adoptTopic() else if (kind == "less") notForMe()
@@ -1076,6 +1140,177 @@ class MainActivity : Activity() {
         val c = current ?: return
         prefs.edit().putString("blocked", (blockedList() + c.topic).distinct().joinToString("|")).apply()
         statusView.text = "Noted: no more ${c.topic}."
+    }
+
+    // ---------- Conversations: deeper explainer (Wikipedia-grounded) and follow-ups ----------
+    private fun loadConvos(): ArrayList<Convo> {
+        val out = ArrayList<Convo>()
+        try {
+            val arr = JSONArray(prefs.getString("convos", "[]"))
+            for (i in 0 until arr.length()) out.add(Convo.fromJson(arr.getJSONObject(i)))
+        } catch (e: Exception) { }
+        return out
+    }
+
+    private fun persistConvo(cv: Convo) {
+        val list = loadConvos().filter { it.id != cv.id }.toMutableList()
+        if (cv.fav) list.add(cv)
+        val arr = JSONArray()
+        for (x in list.takeLast(40)) arr.put(x.toJson())
+        prefs.edit().putString("convos", arr.toString()).apply()
+        exportPrefs()
+    }
+
+    private fun ensureConvo(c: Card): Convo {
+        var cv = c.convo
+        if (cv == null) {
+            val j = c.json
+            cv = Convo(System.currentTimeMillis(), false, c.pillar, c.topic, c.level,
+                j.optString("hook"), j.optString("tell"), j.optString("takeaway"), j.optString("wiki"))
+            c.convo = cv
+        }
+        return cv
+    }
+
+    private fun openMore() {
+        val c = current ?: return
+        val cv = ensureConvo(c)
+        convoReturn = { showFeed() }
+        showConvo(cv)
+    }
+
+    private fun refreshConvo(cv: Convo) {
+        if (cv.fav) persistConvo(cv)
+        if (currentConvo === cv && screenName == "convo") showConvo(cv)
+    }
+
+    private fun showConvo(cv: Convo) {
+        currentConvo = cv
+        if (cv.body.isEmpty() && !cv.loading && cv.error.isEmpty()) startDeepLoad(cv, false)
+        val pcol = pc(cv.pillar)
+        val root = vertical().apply { setPadding(dp(16), dp(12), dp(16), dp(16)) }
+        root.addView(row(
+            btn("Back") { convoReturn() },
+            btn(if (cv.fav) "Favourited" else "Favourite", cv.fav, pcol) { cv.fav = !cv.fav; persistConvo(cv); showConvo(cv) }
+        ))
+        root.addView(text(cv.topic.uppercase() + "  |  " + cv.pillar, 12f, true).apply { setTextColor(pcol) })
+        root.addView(text(if (cv.headline.isNotEmpty()) cv.headline else cv.hook, 22f, true))
+        if (cv.body.isNotEmpty()) {
+            val bodyCard = card()
+            bodyCard.addView(text(cv.body, 17f))
+            put(root, bodyCard)
+            if (cv.source.isNotEmpty()) {
+                root.addView(text("Source: Wikipedia, \"${cv.source}\" (CC BY-SA 4.0)", 12f))
+                root.addView(btn("Open on Wikipedia", false, pcol) { openUrl("https://en.wikipedia.org/wiki/" + Uri.encode(cv.source.replace(' ', '_'))) })
+            } else {
+                root.addView(text("AI overview. Not checked against a source, so treat it with care.", 12f, true))
+            }
+        } else if (cv.loading) {
+            root.addView(text("Reading up on this...", 16f))
+        } else if (cv.error.isNotEmpty()) {
+            root.addView(text(cv.error, 15f))
+            root.addView(btn("Try again", true, pcol) { cv.error = ""; showConvo(cv) })
+            root.addView(btn("Write an unchecked AI overview") { cv.error = ""; startDeepLoad(cv, true); showConvo(cv) })
+        }
+        var lastTurn: View? = null
+        for ((q, a) in cv.turns) {
+            root.addView(text(q, 16f, true).apply { setTextColor(pcol) })
+            val ac = card()
+            ac.addView(text(a, 16f))
+            put(root, ac)
+            lastTurn = ac
+        }
+        if (cv.asking) root.addView(text("Thinking...", 15f))
+        if (cv.body.isNotEmpty() && !cv.asking) {
+            root.addView(text("Keep exploring:", 14f, true))
+            for (ch in cv.chips) put(root, btn(ch, false, pcol) { askFollowUp(cv, ch) }.apply { gravity = Gravity.START or Gravity.CENTER_VERTICAL }, 6)
+        }
+        val sv = ScrollView(this)
+        sv.addView(root)
+        setRoot("convo", sv)
+        val target = lastTurn
+        if (target != null) sv.post { sv.scrollTo(0, maxOf(0, target.top - dp(80))) }
+    }
+
+    private fun startDeepLoad(cv: Convo, unsourced: Boolean) {
+        cv.loading = true
+        cv.error = ""
+        Thread {
+            try {
+                var src: Pair<String, String>? = null
+                var srcErr = ""
+                if (!unsourced) {
+                    try { src = Net.wikiExtract(cv.wiki) } catch (e: Exception) { srcErr = e.message ?: "" }
+                    if (src == null) {
+                        try {
+                            val t = Net.wikiSearch(if (cv.wiki.isNotBlank()) cv.wiki else cv.topic + " " + cv.hook)
+                            if (t != null) src = Net.wikiExtract(t)
+                        } catch (e: Exception) { srcErr = e.message ?: "" }
+                    }
+                    if (src == null) throw RuntimeException("I could not find a good source for this one." + (if (srcErr.isNotEmpty()) " ($srcErr)" else ""))
+                }
+                val source = src
+                val srcText = if (source != null) "SOURCE (Wikipedia article \"${source.first}\"): ${source.second}"
+                    else "No source is available: use only well-established facts you are certain of, and keep claims modest."
+                val prompt = "You are a friendly, knowledgeable guide for adults in the UK (use UK spelling). The reader just saw this card: \"${cv.hook}\" (topic: ${cv.topic}). " +
+                    "Write a deeper look at the idea. " +
+                    (if (source != null) "Use ONLY information in the source text below; do not add facts that are not in it. If the source is clearly not about this idea, reply with ONLY {\"mismatch\": true}. " else "") +
+                    "Reply with ONLY a JSON object with keys: headline (one engaging sentence), body (about 200 words in 3 or 4 short paragraphs separated by a blank line; plain text, no lists, no markdown), " +
+                    "followups (an array of exactly 5 short curious questions the reader might tap next, each under 12 words). Reader level: ${LEVELS[cv.level]}. $srcText"
+                val (_, raw) = fetchText(prompt, true, 0.4, true, null)
+                val o = Net.extractJson(raw)
+                if (o.optBoolean("mismatch", false)) throw RuntimeException("The source did not match this topic, so I did not use it.")
+                val body = o.optString("body").trim()
+                val chips = ArrayList<String>()
+                val fa = o.optJSONArray("followups")
+                if (fa != null) for (i in 0 until fa.length()) { val t = fa.optString(i).trim(); if (t.isNotEmpty()) chips.add(t) }
+                if (body.length < 250 || chips.size < 3) throw RuntimeException("The overview came back too short. Try again.")
+                runOnUiThread {
+                    cv.headline = o.optString("headline").trim()
+                    cv.body = body
+                    cv.source = source?.first ?: ""
+                    cv.extract = (source?.second ?: "").take(2500)
+                    cv.chips = chips
+                    cv.loading = false
+                    logEvent("deeper", cv.pillar, 2)
+                    refreshConvo(cv)
+                }
+            } catch (e: Exception) {
+                runOnUiThread { cv.loading = false; cv.error = e.message ?: "Something went wrong."; refreshConvo(cv) }
+            }
+        }.start()
+    }
+
+    private fun askFollowUp(cv: Convo, q: String) {
+        if (cv.asking) return
+        cv.asking = true
+        showConvo(cv)
+        Thread {
+            try {
+                val ctx = cv.turns.takeLast(2).joinToString("\n") { "Q: ${it.first}\nA: ${it.second}" }
+                val prompt = "You are a friendly, knowledgeable guide for adults in the UK (use UK spelling). Topic: \"${cv.hook}\". " +
+                    (if (cv.extract.isNotEmpty()) "Background source text (Wikipedia \"${cv.source}\"): ${cv.extract} " else "") +
+                    "Earlier in this conversation: $ctx. The reader tapped this question: \"$q\". " +
+                    "Answer in about 100 to 130 words of plain text in 2 short paragraphs. Prefer the source text; otherwise use only well-established facts and say so briefly if unsure. " +
+                    "Then suggest 3 new short follow-up questions. Reply with ONLY a JSON object with keys: answer (string), followups (array of exactly 3 strings, each under 12 words)."
+                val (_, raw) = fetchText(prompt, true, 0.5, true, null)
+                val o = Net.extractJson(raw)
+                val ans = o.optString("answer").trim()
+                val chips = ArrayList<String>()
+                val fa = o.optJSONArray("followups")
+                if (fa != null) for (i in 0 until fa.length()) { val t = fa.optString(i).trim(); if (t.isNotEmpty()) chips.add(t) }
+                if (ans.length < 60) throw RuntimeException("the answer came back too short")
+                runOnUiThread {
+                    cv.turns.add(Pair(q, ans))
+                    if (chips.size >= 2) cv.chips = chips
+                    cv.asking = false
+                    logEvent("followup", cv.pillar, 1)
+                    refreshConvo(cv)
+                }
+            } catch (e: Exception) {
+                runOnUiThread { cv.asking = false; cv.turns.add(Pair(q, "Sorry, I could not answer that (${e.message}). Try another question.")); refreshConvo(cv) }
+            }
+        }.start()
     }
 
     // ---------- Question quality test (rate generated cards to tune the prompts) ----------
@@ -1120,7 +1355,7 @@ class MainActivity : Activity() {
         put(root, card().apply { addView(text(j.optString("tell"), 16f)) })
         val q = card(pc(m))
         q.addView(text(j.optString("question"), 18f, true))
-        for (i in 0..2) q.addView(text("${"ABC"[i]}. ${c.options[i]}" + (if (i == c.correct) "    <-- intended answer" else ""), 16f))
+        for (i in c.options.indices) q.addView(text("${"ABC"[i]}. ${c.options[i]}" + (if (i == c.correct) "    <-- intended answer" else ""), 16f))
         q.addView(text("Why: " + j.optString("why"), 14f))
         put(root, q)
         root.addView(text("Rate this card:", 15f, true))
@@ -1253,12 +1488,26 @@ class MainActivity : Activity() {
         val root = vertical()
         root.addView(btn("Back to home") { showHome() })
         root.addView(text("Favourites", 24f, true))
-        val arr = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
-        if (arr.length() == 0) root.addView(text("Nothing saved yet. Tap Favourite on a card.", 16f))
-        for (i in arr.length() - 1 downTo 0) {
-            val o = arr.getJSONObject(i); val c = o.getJSONObject("card")
-            root.addView(text("${o.optString("topic")}: ${c.optString("hook")}", 16f, true))
-            root.addView(text("${c.optString("question")}\n${c.optString("answer")}", 14f))
+        val list = loadConvos().reversed()
+        if (list.isEmpty()) root.addView(text("Nothing saved yet. Tap Favourite on a card, then More about this to keep the conversation going.", 16f))
+        for (cv in list) {
+            val cd = card(pc(cv.pillar))
+            cd.addView(text(cv.hook, 17f, true))
+            cd.addView(text("${cv.topic}  |  ${cv.pillar}  |  ${cv.turns.size} follow-up(s)", 13f))
+            cd.addView(row(
+                btn("Open", true, pc(cv.pillar)) { convoReturn = { showFavourites() }; showConvo(cv) },
+                btn("Remove") { cv.fav = false; persistConvo(cv); showFavourites() }
+            ))
+            put(root, cd)
+        }
+        val old = try { JSONArray(prefs.getString("favs", "[]")) } catch (x: Exception) { JSONArray() }
+        if (old.length() > 0) {
+            root.addView(text("Older saved cards", 18f, true))
+            for (i in old.length() - 1 downTo 0) {
+                val o = old.getJSONObject(i); val c = o.getJSONObject("card")
+                root.addView(text("${o.optString("topic")}: ${c.optString("hook")}", 15f, true))
+                root.addView(text("${c.optString("question")}\n${c.optString("answer")}", 13f))
+            }
         }
         screen("favourites", root)
     }
