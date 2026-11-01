@@ -40,6 +40,8 @@ object Net {
     val PROVIDERS = listOf("Groq", "Gemini", "OpenRouter")
 
     private val GROQ_MODELS = listOf("llama-3.3-70b-versatile", "openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.1-8b-instant")
+    private val GROQ_STRONG = listOf("llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b")
+    private val GEMINI_STRONG = listOf("gemini-flash-latest")
     private val GEMINI_MODELS = listOf("gemini-flash-latest", "gemini-flash-lite-latest")
     private val OPENROUTER_MODELS = listOf("openrouter/free", "meta-llama/llama-3.3-70b-instruct:free")
 
@@ -127,11 +129,11 @@ object Net {
         throw RuntimeException(last)
     }
 
-    private fun gemini(key: String, prompt: String, needJson: Boolean): String {
+    private fun gemini(key: String, prompt: String, needJson: Boolean, temp: Double, models: List<String>): String {
         val req = JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
-            .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
-        return tryModels(GEMINI_MODELS, needJson, { m ->
+            .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", temp))
+        return tryModels(models, needJson, { m ->
             postJson("https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent",
                 mapOf("x-goog-api-key" to key), req.toString())
         }, { t ->
@@ -140,10 +142,10 @@ object Net {
         })
     }
 
-    private fun openAiStyle(url: String, key: String, models: List<String>, prompt: String, needJson: Boolean): String {
+    private fun openAiStyle(url: String, key: String, models: List<String>, prompt: String, needJson: Boolean, temp: Double): String {
         try {
             return tryModels(models, needJson, { m ->
-                val req = JSONObject().put("model", m).put("max_tokens", 2000)
+                val req = JSONObject().put("model", m).put("max_tokens", 2000).put("temperature", temp)
                 if (m.startsWith("openai/gpt-oss")) req.put("reasoning_effort", "low")
                 req.put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
                 postJson(url, mapOf("Authorization" to "Bearer $key"), req.toString())
@@ -165,20 +167,21 @@ object Net {
     }
 
     /** Ask one provider. Returns raw model text. */
-    fun ask(provider: String, key: String, prompt: String, needJson: Boolean = false): String = when (provider) {
-        "Gemini" -> gemini(key, prompt, needJson)
-        "Groq" -> openAiStyle("https://api.groq.com/openai/v1/chat/completions", key, GROQ_MODELS, prompt, needJson)
-        "OpenRouter" -> openAiStyle("https://openrouter.ai/api/v1/chat/completions", key, OPENROUTER_MODELS, prompt, needJson)
+    fun ask(provider: String, key: String, prompt: String, needJson: Boolean = false, temp: Double = 0.7, strong: Boolean = false): String = when (provider) {
+        "Gemini" -> gemini(key, prompt, needJson, temp, if (strong) GEMINI_STRONG else GEMINI_MODELS)
+        "Groq" -> openAiStyle("https://api.groq.com/openai/v1/chat/completions", key, if (strong) GROQ_STRONG else GROQ_MODELS, prompt, needJson, temp)
+        "OpenRouter" -> openAiStyle("https://openrouter.ai/api/v1/chat/completions", key, OPENROUTER_MODELS, prompt, needJson, temp)
         else -> throw RuntimeException("Unknown provider $provider")
     }
 
     /** Auto: tries every provider that has a key, in order. Returns Pair(providerUsed, text). */
-    fun askAuto(keys: Map<String, String>, prompt: String, needJson: Boolean = false): Pair<String, String> {
+    fun askAuto(keys: Map<String, String>, prompt: String, needJson: Boolean = false, temp: Double = 0.7, strong: Boolean = false, avoid: String? = null): Pair<String, String> {
         val errors = StringBuilder()
-        for (p in PROVIDERS) {
+        val order = if (avoid == null) PROVIDERS else PROVIDERS.filter { it != avoid } + PROVIDERS.filter { it == avoid }
+        for (p in order) {
             val k = keys[p] ?: ""
             if (k.isEmpty()) continue
-            try { return Pair(p, ask(p, k, prompt, needJson)) }
+            try { return Pair(p, ask(p, k, prompt, needJson, temp, strong)) }
             catch (e: Exception) { errors.append("$p: ${e.javaClass.simpleName}: ${e.message}\n") }
         }
         throw RuntimeException(if (errors.isEmpty()) "No keys saved." else "All providers failed:\n$errors")

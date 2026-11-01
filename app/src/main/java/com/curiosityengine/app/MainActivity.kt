@@ -1,6 +1,8 @@
 package com.curiosityengine.app
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Canvas
@@ -42,6 +44,10 @@ class Card(val topic: String, val kind: String, val via: String, val pillar: Str
     var revealed = false
     var guess = ""
     var feedback = ""
+    var options: List<String> = emptyList()
+    var correct = -1
+    var chosen = -1                          // -1 unanswered, 0..2 option tapped, -2 typed answer
+    var checked = true                       // false if the reviewer pass was unavailable
     var minutes = 5
     var level = 0
     var actionState: String? = null          // "done" or "skip"
@@ -274,6 +280,14 @@ class MainActivity : Activity() {
     private lateinit var scroll: ScrollView
     private lateinit var explainerCard: LinearLayout
     private lateinit var answerCard: LinearLayout
+    private lateinit var questionCard: LinearLayout
+    private lateinit var optionsBox: LinearLayout
+    private lateinit var typeBtn: Button
+    private var testPlan: List<Pair<String, Int>> = emptyList()
+    private var testIdx = 0
+    private val testResults = ArrayList<JSONObject>()
+    private val GREEN = Color.parseColor("#2E7D32")
+    private val RED = Color.parseColor("#C62828")
     private lateinit var thoughtCard: LinearLayout
     private lateinit var thoughtView: TextView
     private var kbUp = false
@@ -659,32 +673,34 @@ class MainActivity : Activity() {
         statusView = text("", 13f)
         hookView = text("", 22f, true)
         explainerView = text("", 17f)
-        questionView = text("", 19f)
+        questionView = text("", 19f, true)
         answerView = text("", 17f)
         thoughtView = text("", 16f).apply { setTypeface(typeface, Typeface.ITALIC) }
         explainerCard = card().apply { addView(explainerView) }
-        val questionCard = card(pcol).apply { addView(questionView) }
+        optionsBox = vertical()
+        questionCard = card(pcol).apply { addView(questionView); addView(optionsBox) }
         answerCard = card().apply { addView(answerView) }
         thoughtCard = card().apply { addView(thoughtView) }
         guessField = EditText(this).apply {
-            hint = when (mode) {
-                "THINK" -> "Tap here to type your answer (earns THINK minutes)"
-                "LEARN" -> "Tap here to type your answer (optional)"
-                else -> "Tap here to type your guess (optional)"
-            }
+            hint = "Type your answer"
             textSize = 19f * fs()
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             imeOptions = EditorInfo.IME_ACTION_DONE
             setHorizontallyScrolling(false)
             minLines = 2; maxLines = 4
             setOnEditorActionListener { _, actionId, _ -> if (actionId == EditorInfo.IME_ACTION_DONE) { hideKeyboard(); true } else false }
+            visibility = View.GONE
         }
-        revealBtn = btn("Show answer", true, pcol) { reveal() }
+        revealBtn = btn("Check my typed answer", true, pcol) { revealTyped() }.apply { visibility = View.GONE }
+        typeBtn = btn("Prefer to type your answer?", false, pcol) {
+            typeBtn.visibility = View.GONE; guessField.visibility = View.VISIBLE; revealBtn.visibility = View.VISIBLE
+        }
 
         content.addView(statusView)
         put(content, hookView, 4)
         put(content, explainerCard)
         put(content, questionCard)
+        put(content, typeBtn, 6)
         put(content, guessField, 6)
         put(content, revealBtn, 6)
         put(content, answerCard)
@@ -702,8 +718,7 @@ class MainActivity : Activity() {
         outer.addView(dock)
         setRoot("feed", outer)
 
-        // keyboard: appears only when the answer box is tapped; while typing, hide the header, strip and dock
-        // so the question and the box stay visible; close it on Show answer / Next / Done.
+        // keyboard appears only when the typing box is used; then header, strip and dock hide so the question stays visible
         outer.isFocusableInTouchMode = true
         outer.requestFocus()
         val decor = window.decorView
@@ -716,7 +731,7 @@ class MainActivity : Activity() {
                 kbUp = up
                 val vis = if (up) View.GONE else View.VISIBLE
                 dock.visibility = vis; headerWrap.visibility = vis; stripView.visibility = vis
-                if (up) scroll.post { scroll.scrollTo(0, hookView.top) }
+                if (up) scroll.post { scroll.scrollTo(0, questionCard.top) }
             }
         }
         decor.viewTreeObserver.addOnGlobalLayoutListener(l)
@@ -752,47 +767,114 @@ class MainActivity : Activity() {
         return Pair(pool[0], "preferred")
     }
 
-    private fun fetchText(prompt: String, needJson: Boolean = false): Pair<String, String> {
+    private fun fetchText(prompt: String, needJson: Boolean = false, temp: Double = 0.7, strong: Boolean = false, avoid: String? = null): Pair<String, String> {
         val choice = prefs.getString("provider", "Auto") ?: "Auto"
-        if (choice == "Auto") return Net.askAuto(Net.PROVIDERS.associate { it to keyFor(it) }, prompt, needJson)
+        if (choice == "Auto") return Net.askAuto(Net.PROVIDERS.associate { it to keyFor(it) }, prompt, needJson, temp, strong, avoid)
         if (keyFor(choice).isEmpty()) throw RuntimeException("No $choice key saved. Open Settings.")
-        return Pair(choice, Net.ask(choice, keyFor(choice), prompt, needJson))
+        return Pair(choice, Net.ask(choice, keyFor(choice), prompt, needJson, temp, strong))
     }
 
-    private fun levelText(level: Int) = when (level) {
-        0 -> "BEGINNER: assume no prior knowledge, use plain everyday words, no jargon; something a curious 12-year-old could attempt."
-        1 -> "INTERMEDIATE: assume some familiarity; basic terms are fine."
-        else -> "ADVANCED: assume a solid background; technical and nuanced is fine."
+    private fun levelRules(level: Int) = when (level) {
+        0 -> "BEGINNER. One simple idea in everyday words: no jargon, no dates, no numbers beyond simple counts. " +
+            "The 'tell' must contain everything needed, so someone who knows nothing about the topic can answer correctly just by reading it. " +
+            "The question must be answerable from the 'tell' alone. Wrong options must be clearly wrong, never tricky. " +
+            "GOOD example (topic: Space): tell 'The Moon is slowly drifting away from the Earth, by a few centimetres every year.' " +
+            "question 'Over millions of years, what is the Moon doing?' options ['Moving slowly away from Earth', 'Moving slowly closer to Earth', 'Staying exactly where it is']. " +
+            "BAD examples: 'What is the Chandrasekhar limit?' (needs specialist knowledge); 'Which statement is true?' (vague)."
+        1 -> "INTERMEDIATE. Assume general knowledge of the topic; basic terms are fine. The question may need one step of reasoning from the 'tell'. Wrong options are plausible but definitely wrong."
+        else -> "ADVANCED. Assume a solid background; technical terms are fine. The question applies the idea to a new case. Still exactly one defensible answer; wrong options are plausible but definitely wrong."
     }
 
-    private fun fetchCard(): Card {
-        val m = mode
+    private val MC_RULES = "'question' = ONE clear question (under 25 words). 'options' = exactly 3 short answers (under 12 words each); exactly ONE is correct and defensible; " +
+        "the other two are clearly wrong yet plausible, never partly true, never 'all of the above' or 'none of the above'. 'correct' = index (0, 1 or 2) of the right option. 'why' = 1 or 2 sentences."
+
+    private val THINK_TEMPLATES = listOf(
+        "ESTIMATE: 'tell' sets a real-world scene and gives the facts needed. 'question' asks for a sensible estimate; the three options are clearly separated sizes or ranges (each at least 5 times apart) so only one is sensible.",
+        "ODD ONE OUT: 'tell' states a clear rule or property. 'question' asks which of three items does not fit; exactly one item breaks the rule.",
+        "PATTERN: 'tell' shows a simple number pattern with an obvious rule (add, double, alternate). 'question' asks what comes next. Use small whole numbers and check the arithmetic carefully.",
+        "LOGIC: 'tell' states 2 or 3 simple facts. 'question' asks what must be true as a result. Exactly one option follows from the facts; the others contradict them or do not follow."
+    )
+
+    private fun buildPrompt(m: String, topic: String, level: Int, avoid: String): String {
+        val common = "You write cards for a friendly knowledge app for adults in the UK (use UK spelling). Topic: $topic. " +
+            "LEVEL RULES: ${levelRules(level)} " +
+            "ACCURACY RULES: use only well-established facts you are certain of (textbook or encyclopaedia level). " +
+            "Never use 'latest', 'record', 'currently' or statistics that change. Avoid exact numbers, dates and obscure names unless essential and certain. " +
+            "If unsure, choose a simpler, safer fact. Avoid repeating these earlier hooks: $avoid. "
+        val body = when (m) {
+            "LEARN" -> "Write a TEACHING card. 'tell' = 3 or 4 short plain sentences explaining one idea. " + MC_RULES
+            "THINK" -> "Write a BRAIN CHALLENGE card. Theme it on $topic where natural, but it must be solvable from the 'tell' alone. " +
+                THINK_TEMPLATES[rnd.nextInt(THINK_TEMPLATES.size)] + " " + MC_RULES
+            else -> "Write a DISCOVERY card that tempts the reader toward something new. 'tell' = 3 or 4 vivid, accurate sentences. There is no question."
+        }
+        val keys = if (m == "DISCOVER") "hook, tell, takeaway, action" else "hook, tell, question, options, correct, why, takeaway, action"
+        return common + body + " Also: 'hook' = one intriguing sentence of at most 20 words; 'takeaway' = one sentence the reader could say to a friend, at most 25 words; " +
+            "'action' = one short inspiring thought to carry into real life today, under 20 words. " +
+            "Reply with ONLY a JSON object with these keys: $keys. All values are strings except 'options' (array of exactly 3 strings) and 'correct' (integer 0, 1 or 2)."
+    }
+
+    /** Returns null if the card is structurally sound, otherwise the problem. */
+    private fun validateCard(j: JSONObject, m: String): String? {
+        for (k in listOf("hook", "tell", "takeaway", "action")) if (j.optString(k).isBlank()) return "missing $k"
+        val changing = Regex("(?i)\\b(latest|newest|currently|as of|record-breaking)\\b")
+        if (changing.containsMatchIn(j.optString("tell") + " " + j.optString("question"))) return "uses changing facts"
+        if (m == "DISCOVER") return null
+        val q = j.optString("question")
+        if (q.isBlank() || q.length > 220) return "bad question"
+        if (j.optString("why").isBlank()) return "missing why"
+        val arr = j.optJSONArray("options") ?: return "no options"
+        if (arr.length() != 3) return "options not 3"
+        val seen = HashSet<String>()
+        for (i in 0 until 3) {
+            val o = arr.optString(i).trim()
+            if (o.isEmpty() || o.length > 110) return "bad option"
+            if (Regex("(?i)(all|none) of the above|\\bboth\\b").containsMatchIn(o)) return "banned option text"
+            if (!seen.add(o.lowercase())) return "duplicate options"
+        }
+        if (j.optInt("correct", -1) !in 0..2) return "bad correct index"
+        return null
+    }
+
+    /** Second model reviews the card. Returns null if it passes, else the problem. Throws if no reviewer is reachable. */
+    private fun checkCard(j: JSONObject, level: Int, via: String): String? {
+        val prompt = "You are a strict reviewer of quiz cards for a knowledge app. Card: $j (options are numbered from 0; 'correct' is the index the author says is right). " +
+            "Check: 1) the option marked correct is factually correct; 2) the other two options are definitely wrong; " +
+            "3) the question is clear, has exactly one defensible answer, and does not depend on changing facts; " +
+            (if (level == 0) "4) it is answerable from the 'tell' alone by someone who knows nothing about the topic; " else "4) the difficulty is sensible for the level; ") +
+            "5) any reasoning or arithmetic is right. Reply with ONLY a JSON object {\"ok\": true or false, \"problem\": \"short reason, or empty\"}. Be strict: if in doubt, ok=false."
+        val (_, raw) = fetchText(prompt, true, 0.1, true, via)
+        val o = Net.extractJson(raw)
+        return if (o.optBoolean("ok", false)) null else o.optString("problem", "failed review").ifBlank { "failed review" }
+    }
+
+    private fun fetchCard(m: String = mode, forceLevel: Int? = null): Card {
         val (topic, kind) = pickTopic(m)
-        val level = lvl(topic)
+        val level = forceLevel ?: lvl(topic)
         val avoid = recentHooks.takeLast(6).joinToString(" | ")
-        val extra = when (m) {
-            "LEARN" -> "This is a TEACHING card. 'explainer' is 4-5 clear sentences that teach the idea; the learner reads it first. " +
-                "'question' is a short check question answerable from the explainer; 'answer' is its correct answer (1-2 sentences). "
-            "THINK" -> "This is a BRAIN CHALLENGE card: a logic puzzle, estimation, pattern, or reasoning problem related to the topic, " +
-                "solvable by reasoning without obscure facts. 'question' states the whole challenge; 'answer' gives the solution with brief reasoning. "
-            else -> "This is a DISCOVERY card that tempts the learner toward something new. 'hook' is a vivid teaser; 'answer' is a 2-sentence taste of the topic; " +
-                "'question' is a wondering question; 'search' is a 3-6 word web search to explore it. "
+        var lastProblem = "no attempt"
+        for (attempt in 1..3) {
+            val (via, raw) = fetchText(buildPrompt(m, topic, level, avoid), true, 0.6, true, null)
+            val j = try { Net.extractJson(raw) } catch (e: Exception) { lastProblem = "unreadable reply"; continue }
+            val err = validateCard(j, m)
+            if (err != null) { lastProblem = err; continue }
+            var reviewed = true
+            if (m != "DISCOVER") {
+                val problem = try { checkCard(j, level, via) } catch (e: Exception) { reviewed = false; null }
+                if (problem != null) { lastProblem = "reviewer: $problem"; continue }
+            }
+            val c = Card(topic, kind, via, m, j)
+            c.level = level
+            c.checked = reviewed
+            if (m != "DISCOVER") {
+                val arr = j.getJSONArray("options")
+                val opts = (0..2).map { arr.getString(it).trim() }
+                val order = listOf(0, 1, 2).shuffled(rnd)        // models tend to put the right answer first
+                c.options = order.map { opts[it] }
+                c.correct = order.indexOf(j.getInt("correct"))
+            }
+            return c
         }
-        val keys = when (m) {
-            "LEARN" -> "hook, explainer, question, answer, fact, action"
-            "THINK" -> "hook, question, answer, fact, action"
-            else -> "hook, question, answer, fact, search, action"
-        }
-        val prompt = "You are a curiosity coach. Create one card about: $topic. Difficulty level: ${levelText(level)} $extra" +
-            "Make it surprising and specific. Avoid repeating these earlier hooks: $avoid. " +
-            "Reply with ONLY a JSON object with these keys: $keys. All values are strings except minutes. " +
-            "'fact' is one surprising related fact. 'hook' is one intriguing sentence. " +
-            "'action' is one short inspiring thought or idea to carry into real life today, under 20 words, related to the topic."
-        val (via, raw) = fetchText(prompt, true)
-        val j = Net.extractJson(raw)
-        val c = Card(topic, kind, via, m, j)
-        c.level = level
-        return c
+        throw RuntimeException("Could not make a reliable card after 3 tries ($lastProblem). Tap Next card to retry.")
     }
 
     private fun prefetch() {
@@ -831,17 +913,17 @@ class MainActivity : Activity() {
         val j = c.json
         recentHooks.add(j.optString("hook"))
         headerWrap.removeAllViews()
-        headerWrap.addView(HeaderArt(this, pc(c.pillar), c.pillar, c.topic, "${LEVELS[c.level]}  |  ${c.kind}  |  via ${c.via}"),
+        headerWrap.addView(HeaderArt(this, pc(c.pillar), c.pillar, c.topic,
+            "${LEVELS[c.level]}  |  ${c.kind}  |  via ${c.via}" + (if (c.checked) "" else "  |  unreviewed")),
             LinearLayout.LayoutParams(MATCH, WRAP))
         statusView.text = ""
         hookView.text = j.optString("hook")
-        explainerView.text = j.optString("explainer")
-        questionView.text = when (c.pillar) {
-            "LEARN" -> "CHECK YOURSELF\n"
-            "THINK" -> "CHALLENGE\n"
-            else -> "WONDER\n"
-        } + j.optString("question")
+        explainerView.text = j.optString("tell")
+        questionView.text = (if (c.pillar == "THINK") "CHALLENGE\n" else "CHECK YOURSELF\n") + j.optString("question")
         guessField.setText("")
+        guessField.visibility = View.GONE
+        revealBtn.visibility = View.GONE
+        typeBtn.visibility = if (c.pillar != "DISCOVER" && !c.revealed) View.VISIBLE else View.GONE
         if (c.pillar == "DISCOVER" && !c.revealed) {
             c.revealed = true
             if (c.flags.add("viewed")) logEvent("view", "DISCOVER", 1)
@@ -850,44 +932,83 @@ class MainActivity : Activity() {
         scroll.post { scroll.scrollTo(0, 0) }
     }
 
+    private fun renderOptions(c: Card) {
+        optionsBox.removeAllViews()
+        for (i in 0..2) {
+            val label = "${"ABC"[i]}.  ${c.options[i]}"
+            val b: Button = when {
+                c.chosen == -1 -> btn(label, false, pc(c.pillar)) { choose(i) }
+                i == c.correct -> btn(label, true, GREEN) { }
+                i == c.chosen -> btn(label, false, RED) { }
+                else -> btn(label, false, Color.parseColor("#9E9E9E")) { }
+            }
+            b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            put(optionsBox, b, 8)
+        }
+    }
+
     private fun applyState(c: Card) {
         val j = c.json
-        val p = c.pillar
-        explainerCard.visibility = if (p == "LEARN") View.VISIBLE else View.GONE
+        val isD = c.pillar == "DISCOVER"
+        explainerCard.visibility = View.VISIBLE
+        questionCard.visibility = if (isD) View.GONE else View.VISIBLE
         thoughtView.text = "A THOUGHT FOR TODAY\n" + j.optString("action")
+        if (!isD) renderOptions(c)
         if (!c.revealed) {
-            guessField.visibility = View.VISIBLE; revealBtn.visibility = View.VISIBLE
             answerCard.visibility = View.GONE; thoughtCard.visibility = View.GONE
             return
         }
-        guessField.visibility = View.GONE; revealBtn.visibility = View.GONE
-        val label = when (p) { "DISCOVER" -> "A TASTE"; "THINK" -> "SOLUTION"; else -> "ANSWER" }
-        val g = if (c.guess.isNotEmpty()) "YOUR ANSWER\n${c.guess}\n${c.feedback}\n\n" else ""
-        answerView.text = g + "$label\n${j.optString("answer")}\n\nFACT\n${j.optString("fact")}"
+        typeBtn.visibility = View.GONE; guessField.visibility = View.GONE; revealBtn.visibility = View.GONE
+        val sb = StringBuilder()
+        if (!isD) {
+            if (c.chosen >= 0) {
+                sb.append(if (c.chosen == c.correct) "Correct!\n\n" else "Not quite. The answer is ${"ABC"[c.correct]}: ${c.options[c.correct]}\n\n")
+            } else if (c.guess.isNotEmpty()) {
+                sb.append("YOUR ANSWER\n${c.guess}\n${c.feedback}\n\nThe answer: ${c.options[c.correct]}\n\n")
+            }
+            sb.append("WHY\n${j.optString("why")}\n\n")
+        }
+        sb.append("WORTH SHARING\n${j.optString("takeaway")}")
+        answerView.text = sb.toString()
         answerCard.visibility = View.VISIBLE
         thoughtCard.visibility = View.VISIBLE
     }
 
-    private fun reveal() {
+    private fun choose(i: Int) {
+        val c = current ?: return
+        if (c.revealed) return
+        hideKeyboard()
+        c.chosen = i
+        c.revealed = true
+        if (c.pillar == "THINK") logEvent("guess", "THINK", 2) else logEvent("reveal", c.pillar, 1)
+        if (c.kind != "preferred" && c.pillar != "DISCOVER") logEvent("explore", "DISCOVER", 1)
+        val key = if (i == c.correct) "n_right" else "n_wrong"
+        prefs.edit().putInt(key, prefs.getInt(key, 0) + 1).apply()
+        applyState(c)
+        scroll.post { scroll.smoothScrollTo(0, questionCard.top) }
+    }
+
+    private fun revealTyped() {
         val c = current ?: return
         if (c.revealed) return
         hideKeyboard()
         c.guess = guessField.text.toString().trim()
+        if (c.guess.isEmpty()) { statusView.text = "Type something first, or tap an option."; return }
+        c.chosen = -2
         c.revealed = true
-        val think = c.pillar == "THINK"
-        if (!think) logEvent("reveal", c.pillar, 1)       // THINK minutes come only from real attempts
-        if (think && c.guess.isEmpty()) statusView.text = "No attempt, no THINK minutes. Try an answer next time."
+        if (c.pillar != "THINK") logEvent("reveal", c.pillar, 1)
         if (c.kind != "preferred" && c.pillar != "DISCOVER") logEvent("explore", "DISCOVER", 1)
-        if (c.guess.isNotEmpty()) { c.feedback = "Checking your guess..."; judgeGuess(c) }
+        c.feedback = "Checking your answer..."
+        judgeGuess(c)
         applyState(c)
-        scroll.post { scroll.scrollTo(0, hookView.top) }
+        scroll.post { scroll.smoothScrollTo(0, questionCard.top) }
     }
 
     /** Asks the model to judge the typed guess and shows feedback. A real attempt earns THINK minutes. */
     private fun judgeGuess(c: Card) {
         val j = c.json
         val prompt = "A learner was asked a question and typed a guess before seeing the answer. Judge the guess fairly. " +
-            "Question: ${j.optString("question")}. Correct answer: ${j.optString("answer")}. Learner's guess: ${c.guess}. " +
+            "Question: ${j.optString("question")}. Correct answer: ${c.options.getOrElse(c.correct) { "" }}. Reason: ${j.optString("why")}. Learner's guess: ${c.guess}. " +
             "Reply with ONLY a JSON object with string keys: verdict (exactly one of: spot_on, close, off, no_attempt; " +
             "use no_attempt only for gibberish or a non-answer) and feedback (1-2 plain sentences, warm but honest: " +
             "say what they got right, and what to adjust if anything)."
@@ -955,6 +1076,83 @@ class MainActivity : Activity() {
         val c = current ?: return
         prefs.edit().putString("blocked", (blockedList() + c.topic).distinct().joinToString("|")).apply()
         statusView.text = "Noted: no more ${c.topic}."
+    }
+
+    // ---------- Question quality test (rate generated cards to tune the prompts) ----------
+    private fun showQualityTest() {
+        val plan = ArrayList<Pair<String, Int>>()
+        for (lv in 0..2) for (m in listOf("LEARN", "THINK")) for (n in 1..3) plan.add(Pair(m, lv))
+        plan.shuffle(rnd)
+        testPlan = plan; testIdx = 0; testResults.clear()
+        testNextCard()
+    }
+
+    private fun testRecord(m: String, lv: Int, topic: String, q: String, ans: String, verdict: String, reviewed: Boolean) {
+        testResults.add(JSONObject().put("n", testIdx + 1).put("mode", m).put("level", LEVELS[lv]).put("topic", topic)
+            .put("q", q).put("a", ans).put("v", verdict).put("reviewed", reviewed))
+        testIdx++
+        testNextCard()
+    }
+
+    private fun testNextCard() {
+        if (testIdx >= testPlan.size) { showTestReport(); return }
+        val (m, lv) = testPlan[testIdx]
+        val root = vertical()
+        root.addView(text("Question quality test", 22f, true))
+        root.addView(text("Generating card ${testIdx + 1} of ${testPlan.size} ($m, ${LEVELS[lv]})...", 15f))
+        screen("test", root)
+        Thread {
+            try {
+                val c = fetchCard(m, lv)
+                runOnUiThread { showTestCard(c, m, lv) }
+            } catch (e: Exception) {
+                runOnUiThread { testRecord(m, lv, "-", "-", "-", "generation_failed", false) }
+            }
+        }.start()
+    }
+
+    private fun showTestCard(c: Card, m: String, lv: Int) {
+        val j = c.json
+        val answer = c.options.getOrElse(c.correct) { "" }
+        val root = vertical()
+        root.addView(text("Card ${testIdx + 1} of ${testPlan.size}: $m, ${LEVELS[lv]}, ${c.topic}" + (if (c.checked) "" else " (no reviewer)"), 14f, true))
+        root.addView(text(j.optString("hook"), 20f, true))
+        put(root, card().apply { addView(text(j.optString("tell"), 16f)) })
+        val q = card(pc(m))
+        q.addView(text(j.optString("question"), 18f, true))
+        for (i in 0..2) q.addView(text("${"ABC"[i]}. ${c.options[i]}" + (if (i == c.correct) "    <-- intended answer" else ""), 16f))
+        q.addView(text("Why: " + j.optString("why"), 14f))
+        put(root, q)
+        root.addView(text("Rate this card:", 15f, true))
+        val rec = { v: String -> testRecord(m, lv, c.topic, j.optString("question"), answer, v, c.checked) }
+        root.addView(row(btn("Good", true) { rec("good") }, btn("Too hard") { rec("too_hard") }))
+        root.addView(row(btn("Unclear") { rec("unclear") }, btn("Wrong or odd") { rec("wrong") }))
+        screen("test", root)
+    }
+
+    private fun showTestReport() {
+        val sb = StringBuilder("QUESTION QUALITY TEST\n")
+        for (lvName in LEVELS) {
+            val rs = testResults.filter { it.optString("level") == lvName }
+            val counts = listOf("good", "too_hard", "unclear", "wrong", "generation_failed").joinToString(", ") { v -> "$v ${rs.count { it.optString("v") == v }}" }
+            sb.append("$lvName (${rs.size}): $counts\n")
+        }
+        sb.append("\nFLAGGED CARDS\n")
+        for (r in testResults) if (r.optString("v") != "good") {
+            sb.append("#${r.optInt("n")} ${r.optString("mode")} ${r.optString("level")} [${r.optString("v")}] ${r.optString("topic")}: ${r.optString("q")} | answer: ${r.optString("a")}\n")
+        }
+        val report = sb.toString()
+        prefs.edit().putString("lastTestReport", report).apply()
+        exportPrefs()
+        val root = vertical()
+        root.addView(text("Test finished", 24f, true))
+        root.addView(text(report, 14f).apply { setTextIsSelectable(true) })
+        root.addView(btn("Copy report", true) {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("report", report))
+        })
+        root.addView(btn("Back to settings") { showSettings() })
+        screen("test", root)
     }
 
     // ---------- Weekly review ----------
@@ -1121,6 +1319,7 @@ class MainActivity : Activity() {
             }.start()
         })
         root.addView(out)
+        root.addView(btn("Question quality test (18 cards)") { showQualityTest() })
         val stats = "Signals so far: more ${prefs.getInt("n_more", 0)}, less ${prefs.getInt("n_less", 0)}, " +
             "favourite ${prefs.getInt("n_favourite", 0)}, surprised ${prefs.getInt("n_surprised", 0)}"
         root.addView(text(stats, 13f))
